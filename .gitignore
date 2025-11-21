@@ -29,3 +29,5 @@ vendor/
 # Test outputs
 *.test
 test-results/
+
+examples/out/

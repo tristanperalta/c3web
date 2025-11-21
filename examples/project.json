@@ -1,0 +1,22 @@
+{
+  "langrev": "1",
+  "warnings": ["no-unused"],
+  "dependency-search-paths": ["../lib"],
+  "dependencies": ["c3io"],
+  "targets": {
+    "echo_server": {
+      "type": "executable",
+      "sources": [
+        "echo_server.c3",
+        "../src/common/headers.c3",
+        "../src/common/method.c3",
+        "../src/common/status.c3",
+        "../src/common/version.c3",
+        "../src/http1/parser.c3",
+        "../src/http1/response.c3",
+        "../src/http1/connection.c3"
+      ]
+    }
+  },
+  "link-libc": true
+}
