@@ -19,6 +19,8 @@ struct HeaderMap {
 
 // Header-related faults
 faultdef INVALID_HEADER_NAME, INVALID_HEADER_VALUE, HEADER_NOT_FOUND;
+faultdef INVALID_CONTENT_LENGTH, MULTIPLE_CONTENT_LENGTH_MISMATCH;
+faultdef TRANSFER_ENCODING_WITH_CONTENT_LENGTH;
 
 // Common HTTP headers (RFC 9110)
 const String HEADER_ACCEPT = "accept";
@@ -120,6 +122,10 @@ fn bool is_valid_header_value(String value) {
 <*
  * Add header to map. Validates name and value.
  * Normalizes name to lowercase for case-insensitive lookup.
+ *
+ * Special handling for Content-Length to prevent request smuggling:
+ * - Multiple Content-Length headers must have identical values (RFC 9112 §6.3)
+ * - Transfer-Encoding + Content-Length is rejected (RFC 9112 §6.3 ¶3)
  *>
 fn void? HeaderMap.add(&self, String name, String value) {
     if (!is_valid_header_name(name)) {
@@ -131,6 +137,74 @@ fn void? HeaderMap.add(&self, String name, String value) {
     }
 
     String normalized = normalize_header_name(name, &self.arena);
+
+    // Validate Content-Length value before storing
+    if (normalized == HEADER_CONTENT_LENGTH) {
+        // Validate the Content-Length value is non-negative integer
+        String trimmed = value.trim();
+
+        // Empty string is invalid
+        if (trimmed.len == 0) {
+            return INVALID_CONTENT_LENGTH?;
+        }
+
+        // Check for negative sign (invalid per RFC 9112 §6.3)
+        if (trimmed[0] == '-') {
+            return INVALID_CONTENT_LENGTH?;
+        }
+
+        // Validate all characters are digits
+        foreach (char c : trimmed) {
+            if (!c.is_digit()) {
+                return INVALID_CONTENT_LENGTH?;
+            }
+        }
+
+        // Check for duplicate Content-Length with different value
+        if (self.has(HEADER_CONTENT_LENGTH)) {
+            // Already have Content-Length - verify values match
+            String? existing = self.get(HEADER_CONTENT_LENGTH);
+            if (catch err = existing) {
+                // Shouldn't happen since we just checked has()
+                return err?;
+            }
+            String existing_trimmed = existing.trim();
+            if (existing_trimmed != trimmed) {
+                // Different Content-Length values = request smuggling attack
+                return MULTIPLE_CONTENT_LENGTH_MISMATCH?;
+            }
+            // Same value - OK per RFC, but don't need to store again
+            return;
+        }
+    }
+
+    // Validate Transfer-Encoding header strictly (prevent obfuscation attacks)
+    if (normalized == HEADER_TRANSFER_ENCODING) {
+        // Reject if already exists (multiple TE headers = obfuscation attack)
+        if (self.has(HEADER_TRANSFER_ENCODING)) {
+            return INVALID_HEADER_VALUE?;
+        }
+
+        // Only accept "chunked" (no multiple codings, no whitespace tricks)
+        String trimmed = value.trim();
+        String lower = trimmed.to_lower_tcopy();
+
+        // Reject anything that's not exactly "chunked"
+        if (lower != "chunked") {
+            return INVALID_HEADER_VALUE?;
+        }
+
+        // Reject if Content-Length also present
+        if (self.has(HEADER_CONTENT_LENGTH)) {
+            return TRANSFER_ENCODING_WITH_CONTENT_LENGTH?;
+        }
+    }
+    if (normalized == HEADER_CONTENT_LENGTH) {
+        if (self.has(HEADER_TRANSFER_ENCODING)) {
+            return TRANSFER_ENCODING_WITH_CONTENT_LENGTH?;
+        }
+    }
+
     self.headers.set(normalized, value);
 }
 
@@ -166,13 +240,46 @@ fn void HeaderMap.clear(&self) {
     self.headers.clear();
 }
 
-<* Get Content-Length header value as integer. *>
+<*
+ * Get Content-Length header value as integer with strict validation.
+ * Validates:
+ * - Must be non-negative integer
+ * - No invalid characters (letters, decimals, hex, etc.)
+ * - Multiple Content-Length headers must have identical values
+ *>
 fn usz? HeaderMap.get_content_length(&self) {
     String? value = self.get(HEADER_CONTENT_LENGTH);
     if (catch err = value) {
         return err?;
     }
-    return value.to_ulong();
+
+    // Trim whitespace (RFC allows OWS around field value)
+    String trimmed = value.trim();
+
+    // Empty string is invalid
+    if (trimmed.len == 0) {
+        return INVALID_CONTENT_LENGTH?;
+    }
+
+    // Check for negative sign (invalid per RFC 9112 §6.3)
+    if (trimmed[0] == '-') {
+        return INVALID_CONTENT_LENGTH?;
+    }
+
+    // Validate all characters are digits
+    foreach (char c : trimmed) {
+        if (!c.is_digit()) {
+            return INVALID_CONTENT_LENGTH?;
+        }
+    }
+
+    // Parse as unsigned long (any parse error = invalid Content-Length)
+    if (catch err = trimmed.to_ulong()) {
+        return INVALID_CONTENT_LENGTH?;
+    }
+    ulong result = trimmed.to_ulong()!;
+
+    return (usz)result;
 }
 
 <* Check if Transfer-Encoding is chunked. *>
@@ -208,6 +315,8 @@ fn bool HeaderMap.is_connection_close(&self) {
 <*
  * Parse header line "name: value" into name and value.
  * Trims whitespace from value.
+ *
+ * Rejects whitespace before colon per RFC 9112.
  *>
 fn HeaderField? parse_header_line(String line) {
     // Find colon separator
@@ -216,8 +325,19 @@ fn HeaderField? parse_header_line(String line) {
         return INVALID_HEADER_VALUE?;
     }
 
-    String name = line[0:colon_pos].trim();
+    String name_raw = line[0:colon_pos];
     String value = line[colon_pos + 1..].trim();
+
+    // Reject whitespace before colon (RFC violation, enables obfuscation)
+    // Header name must not have trailing whitespace
+    if (name_raw.len > 0) {
+        char last_char = name_raw[name_raw.len - 1];
+        if (last_char == ' ' || last_char == '\t') {
+            return INVALID_HEADER_NAME?;
+        }
+    }
+
+    String name = name_raw.trim();
 
     if (!is_valid_header_name(name)) {
         return INVALID_HEADER_NAME?;

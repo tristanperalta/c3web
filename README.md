@@ -4,7 +4,12 @@ A HTTP implementation suite for the C3 programming language, providing HTTP/1.1,
 
 ## Features
 
-- HTTP/1.1
+- **HTTP/1.1** (RFC 9112 compliant)
+  - Incremental request parsing with streaming support
+  - Chunked transfer encoding with trailer headers
+  - Security hardening (request smuggling prevention, bare LF rejection, null byte detection)
+  - Body validation with configurable size limits (413, 414 status codes)
+  - HTTP version validation (505 status code)
 - HTTP/2
 - HTTP/3
 - WebSockets
@@ -57,6 +62,6 @@ See `examples/README.md` for more details.
 ### Run All Tests
 
 ```bash
-# Run test suite (15 tests)
+# Run test suite
 c3c test
 ```
