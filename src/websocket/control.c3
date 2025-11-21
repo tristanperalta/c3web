@@ -73,6 +73,23 @@ fn bool is_valid_close_status(ushort code) @public
 }
 
 /**
+ * Create an empty CLOSE frame (no status code)
+ *
+ * RFC 6455 §5.5.1: CLOSE frame may have no payload (no status code, no reason)
+ * This is valid for responding to CLOSE frames without status codes.
+ *
+ * @return Frame data ready to send
+ */
+fn char[] create_empty_close_frame() @public
+{
+    // Build frame: [FIN=1, opcode=CLOSE][payload_len=0]
+    char[] frame_data = mem::new_array(char, 2);
+    frame_data[0] = 0x88;  // FIN=1, RSV=0, opcode=CLOSE
+    frame_data[1] = 0x00;  // MASK=0, payload_len=0
+    return frame_data;
+}
+
+/**
  * Create a CLOSE frame
  *
  * RFC 6455 §5.5.1: Close frame contains a status code (2 bytes)

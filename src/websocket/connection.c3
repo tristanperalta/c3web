@@ -233,15 +233,18 @@ fn char[]? WebSocketConnection.handle_control_frame(&self, char[] frame_data) @p
             {
                 // We haven't sent CLOSE yet - respond with CLOSE
                 self.state = State.CLOSED;
-                ushort status = control::CLOSE_NORMAL;
 
                 // Try to extract status from incoming CLOSE
                 if (try received_status = control::parse_close_status(f))
                 {
-                    status = received_status;
+                    // Echo back the same status code
+                    return control::create_close_frame(received_status, "");
                 }
-
-                return control::create_close_frame(status, "");
+                else
+                {
+                    // No status code in received CLOSE - respond with empty CLOSE
+                    return control::create_empty_close_frame();
+                }
             }
             else
             {

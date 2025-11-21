@@ -44,7 +44,7 @@ struct Frame
  * Frame parsing errors
  */
 faultdef INCOMPLETE_FRAME, INVALID_OPCODE, CONTROL_FRAME_TOO_LARGE,
-         CONTROL_FRAME_FRAGMENTED, INVALID_PAYLOAD_LENGTH;
+         CONTROL_FRAME_FRAGMENTED, INVALID_PAYLOAD_LENGTH, INVALID_RSV_BITS;
 
 /**
  * Check if opcode is a control frame
@@ -100,6 +100,13 @@ fn Frame? parse_header(char[] data) @public
     f.rsv2 = (byte0 & 0x20) != 0;
     f.rsv3 = (byte0 & 0x10) != 0;
     f.opcode = (Opcode)(byte0 & 0x0F);
+
+    // RFC 6455 §5.2: RSV bits MUST be 0 unless extension defines meaning
+    // Since we don't support extensions, reject any non-zero RSV bits
+    if (f.rsv1 || f.rsv2 || f.rsv3)
+    {
+        return INVALID_RSV_BITS?;
+    }
 
     // Validate opcode
     if (!is_valid_opcode(f.opcode))

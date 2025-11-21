@@ -93,6 +93,15 @@ fn void MessageBuilder.set_max_message_size(&self, ulong max_size) @public
  */
 fn void MessageBuilder.reset(&self) @public
 {
+    // Free any copied fragment data
+    for (usz i = 0; i < self.fragment_count; i++)
+    {
+        if (self.fragments[i].data.len > 0)
+        {
+            mem::free(self.fragments[i].data.ptr);
+        }
+    }
+
     self.in_progress = false;
     self.message_opcode = frame::Opcode.CONTINUATION;
     self.fragment_count = 0;
@@ -102,6 +111,7 @@ fn void MessageBuilder.reset(&self) @public
 
 /**
  * Add a fragment to the internal array
+ * Makes a copy of the data since the original buffer may be reused
  */
 fn void MessageBuilder.add_fragment(&self, char[] data, ulong len) @private
 {
@@ -126,8 +136,15 @@ fn void MessageBuilder.add_fragment(&self, char[] data, ulong len) @private
         self.fragments = new_fragments;
     }
 
-    // Add new fragment
-    self.fragments[self.fragment_count].data = data;
+    // Copy the payload data since the original buffer may be modified
+    char[] data_copy = mem::new_array(char, len);
+    foreach (i, byte : data)
+    {
+        data_copy[i] = byte;
+    }
+
+    // Add new fragment with copied data
+    self.fragments[self.fragment_count].data = data_copy;
     self.fragments[self.fragment_count].len = len;
     self.fragment_count++;
 }

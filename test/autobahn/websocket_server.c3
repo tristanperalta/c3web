@@ -9,6 +9,8 @@ module c3web::test::autobahn::server;
 import c3web::websocket::connection;
 import c3web::websocket::handshake;
 import c3web::websocket::frame;
+import c3web::websocket::control;
+import c3web::websocket::message;
 import c3web::http1::parser;
 import async::event_loop;
 import async::tcp;
@@ -241,9 +243,9 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                 // Need more data for header - wait for next read
                 return;
             }
-            // Other header error - protocol violation
+            // Other header error - protocol violation, send close with 1002
             io::eprintfn("[%d] Frame header error: %s", session.session_id, header_err);
-            cleanup_session(session);
+            send_close_and_cleanup(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
             return;
         }
 
@@ -306,16 +308,41 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
             else if (catch control_err = session.ws_conn.handle_control_frame(frame_data))
             {
                 io::eprintfn("[%d] Error handling control frame: %s", session.session_id, control_err);
-                cleanup_session(session);
+                send_close_and_cleanup(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
                 return;
             }
         }
         else
         {
-            // Handle data frame
-            if (try msg = session.ws_conn.receive_message(frame_data))
+            // Handle data frame - call receive_message ONCE
+            connection::Message? msg_result = session.ws_conn.receive_message(frame_data);
+
+            if (catch msg_err = msg_result)
+            {
+                // MESSAGE_INCOMPLETE means fragmented message waiting for continuation
+                if (msg_err == connection::MESSAGE_INCOMPLETE)
+                {
+                    // This is ok - we're in the middle of a fragmented message
+                    // Continue to next frame
+                }
+                else if (msg_err == message::INVALID_UTF8)
+                {
+                    // UTF-8 validation error - use 1007
+                    io::eprintfn("[%d] Invalid UTF-8 in text message", session.session_id);
+                    send_close_and_cleanup(session, control::CLOSE_INVALID_PAYLOAD, "Invalid UTF-8");
+                    return;
+                }
+                else
+                {
+                    io::eprintfn("[%d] Error receiving message: %s", session.session_id, msg_err);
+                    send_close_and_cleanup(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
+                    return;
+                }
+            }
+            else
             {
                 // Got complete message - echo it back
+                connection::Message msg = msg_result;
                 char[]? echo_frame;
 
                 if (msg.opcode == frame::Opcode.TEXT)
@@ -346,20 +373,6 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                 if (msg.payload_len > 0)
                 {
                     mem::free(msg.payload.ptr);
-                }
-            }
-            else if (catch msg_err = session.ws_conn.receive_message(frame_data))
-            {
-                // MESSAGE_INCOMPLETE means fragmented message waiting for continuation
-                if (msg_err == connection::MESSAGE_INCOMPLETE)
-                {
-                    // This is ok - we're in the middle of a fragmented message
-                }
-                else
-                {
-                    io::eprintfn("[%d] Error receiving message: %s", session.session_id, msg_err);
-                    cleanup_session(session);
-                    return;
                 }
             }
         }
@@ -446,6 +459,38 @@ fn void send_http_error(WebSocketSession* session, ushort status, String status_
     response.append(status_text);
 
     session.conn.write((char[])response.str_view(), &on_write_complete, session)!!;
+}
+
+/**
+ * Send a close frame with the given status code and then cleanup
+ */
+fn void send_close_and_cleanup(WebSocketSession* session, ushort status_code, String reason)
+{
+    if (try close_frame = control::create_close_frame(status_code, reason))
+    {
+        io::printfn("[%d] Sending close frame with code %d: %s", session.session_id, status_code, reason);
+        // Send close frame, then cleanup in callback
+        if (catch err = session.conn.write(close_frame, &on_close_write_complete, session))
+        {
+            io::eprintfn("[%d] Failed to send close frame: %s", session.session_id, err);
+            cleanup_session(session);
+        }
+    }
+    else
+    {
+        // Failed to create close frame, just cleanup
+        cleanup_session(session);
+    }
+}
+
+/**
+ * Close frame write completion callback
+ */
+fn void on_close_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
+{
+    WebSocketSession* session = (WebSocketSession*)user_data;
+    io::printfn("[%d] Close frame sent, cleaning up", session.session_id);
+    cleanup_session(session);
 }
 
 /**

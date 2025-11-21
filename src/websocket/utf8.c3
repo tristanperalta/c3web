@@ -42,9 +42,9 @@ const char[256] UTF8_CHAR_CLASS = {
     10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3,
 
     // F0-F4: 4-byte sequence lead
-    11,6,6,6,
+    11,6,6,6,5,
     // F5-FF: Invalid (would encode > U+10FFFF)
-    8,8,8,8,8,8,8,8,8,8,8,8
+    8,8,8,8,8,8,8,8,8,8,8
 };
 
 // UTF-8 DFA state transition table (108 entries = 12 states * 9 character classes)
@@ -63,11 +63,14 @@ const char[108] UTF8_TRANSITIONS = {
     // State 60: Expecting 1 more byte (after 3-byte E0 lead)
     12,24,12,12,12,12,12,12,12,24,12,12,
     // State 72: Expecting 3 more bytes (4-byte starting with F0)
+    // F0 requires second byte 90-BF (classes 7, 9) to avoid overlong
     12,12,12,12,12,12,12,36,12,36,12,12,
-    // State 84: Expecting 3 more bytes (4-byte starting with F4)
-    12,12,12,12,12,12,12,36,12,12,12,12,
-    // State 96: Expecting 2 more bytes (after 4-byte F0 lead)
-    12,36,12,12,12,12,12,36,12,36,12,12
+    // State 84: Expecting 3 more bytes (4-byte starting with F1-F3)
+    // F1-F3 accept second byte 80-BF (classes 1, 7, 9)
+    12,36,12,12,12,12,12,36,12,36,12,12,
+    // State 96: Expecting 2 more bytes (4-byte starting with F4)
+    // F4 requires second byte 80-8F (class 1 only) to stay within U+10FFFF
+    12,36,12,12,12,12,12,12,12,12,12,12
 };
 
 /**
