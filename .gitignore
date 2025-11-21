@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# C3 compiler output
+*.ll
+*.bc
+*.s
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# Dependency directories (but not lib/ submodules)
+vendor/
+
+# Test outputs
+*.test
+test-results/

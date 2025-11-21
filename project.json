@@ -1,0 +1,32 @@
+{
+  "langrev": "1",
+  "warnings": [
+    "no-unused"
+  ],
+  "dependency-search-paths": [
+    "lib"
+  ],
+  "dependencies": [
+    "c3io"
+  ],
+  "authors": [
+    "Tristan Peralta <tristan@peralta.ph>"
+  ],
+  "version": "0.1.0",
+  "sources": [
+    "src/**"
+  ],
+  "test-sources": [
+    "test/**"
+  ],
+  "build-dir": "build",
+  "output": "build",
+  "targets": {
+    "c3web": {
+      "type": "static-lib"
+    }
+  },
+  "link-libc": true,
+  "cpu": "generic",
+  "opt": "O0"
+}
