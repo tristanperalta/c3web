@@ -12,10 +12,10 @@ curl -i http://localhost:8080/ 2>/dev/null
 echo ""
 echo ""
 
-# Test 2: GET with custom headers
-echo "Test 2: GET with custom headers"
-echo "-------------------------------"
-curl -i -H "X-Custom-Header: test-value" -H "User-Agent: c3web-test" http://localhost:8080/test/path 2>/dev/null
+# Test 2: GET with custom headers and query parameters
+echo "Test 2: GET with query parameters and custom headers"
+echo "-----------------------------------------------------"
+curl -i -H "X-Custom-Header: test-value" -H "User-Agent: c3web-test" "http://localhost:8080/test/path?foo=bar&name=c3web&id=123" 2>/dev/null
 echo ""
 echo ""
 

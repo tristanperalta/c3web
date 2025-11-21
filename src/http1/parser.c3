@@ -10,6 +10,8 @@ import c3web::common::method;
 import c3web::common::version;
 import c3web::common::headers;
 import std::io;
+import std::net::url;
+import std::core::string;
 
 <* Parser states for incremental parsing *>
 enum ParserState : char {
@@ -33,7 +35,10 @@ faultdef PARSE_ERROR, INVALID_REQUEST_LINE, HEADER_TOO_LARGE, REQUEST_TOO_LARGE;
 <* HTTP/1.1 request representation *>
 struct Request {
     method::HttpMethod method;
-    String target;
+    String target;              // Raw request target from request line
+    url::Url url;               // Parsed URL (for absolute URIs)
+    String path;                // Decoded path (for origin-form requests)
+    url::UrlQueryValues query;  // Parsed query parameters
     version::HttpVersion version;
     headers::HeaderMap headers;
 }
@@ -178,7 +183,7 @@ fn ParseResult? Parser.parse_request_line(&self) {
     }
 
     // Extract request line
-    String line = buffer_str[..crlf_pos];
+    String line = buffer_str[0:crlf_pos];
 
     // Parse: METHOD SP TARGET SP HTTP/VERSION
     String[]? parts = line.tsplit(" ");
@@ -197,8 +202,33 @@ fn ParseResult? Parser.parse_request_line(&self) {
     }
     self.request.method = parsed_method;
 
-    // Store target (URI)
+    // Store raw target
     self.request.target = parts[1];
+
+    // Parse target as URL
+    // For origin-form (e.g., "/path?query"), prepend scheme+host to make it parseable
+    String target_to_parse = parts[1];
+    if (target_to_parse.starts_with("/")) {
+        // Origin-form: prepend dummy scheme://host for parsing
+        target_to_parse = string::tformat("http://localhost%s", target_to_parse);
+    }
+
+    // Parse URL (use temp allocator for parsing, will copy what we need)
+    url::Url? parsed_url = url::tparse(target_to_parse);
+    if (catch err = parsed_url) {
+        return INVALID_REQUEST_LINE?;
+    }
+
+    // Extract path and query
+    self.request.path = parsed_url.path.copy(tmem);
+    if (parsed_url.query.len > 0) {
+        self.request.query = url::parse_query_to_temp(parsed_url.query);
+    }
+
+    // For absolute-form, store the full URL
+    if (!parts[1].starts_with("/")) {
+        self.request.url = parsed_url;
+    }
 
     // Parse version
     version::HttpVersion? parsed_version = version::parse(parts[2]);
@@ -241,7 +271,7 @@ fn ParseResult? Parser.parse_headers(&self) {
         }
 
         // Parse header line
-        String line = buffer_str[..crlf_pos];
+        String line = buffer_str[0:crlf_pos];
         headers::HeaderField? field = headers::parse_header_line(line);
         if (catch err = field) {
             return PARSE_ERROR?;
@@ -301,7 +331,7 @@ fn char[] Parser.get_body(&self) {
 
     char[] buffer_data = self.get_readable_buffer();
     usz body_len = content_length < buffer_data.len ? content_length : buffer_data.len;
-    return buffer_data[..body_len];
+    return buffer_data[0:body_len];
 }
 
 <*

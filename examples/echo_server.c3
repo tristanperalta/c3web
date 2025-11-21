@@ -22,7 +22,22 @@ fn void handle_request(connection::Connection* conn, parser::Request* request, r
 
     body.appendf("Method: %s\n", request.method.to_string());
     body.appendf("Target: %s\n", request.target);
+    body.appendf("Path: %s\n", request.path);
     body.appendf("Version: %s\n\n", request.version.to_string(tmem));
+
+    // Show query parameters if any
+    if (request.query.key_order.len() > 0) {
+        body.appendf("Query Parameters:\n");
+        body.appendf("-----------------\n");
+        foreach (key : request.query.key_order) {
+            if (try values = request.query.get(key)) {
+                foreach (value : values) {
+                    body.appendf("%s = %s\n", key, value);
+                }
+            }
+        }
+        body.append("\n");
+    }
 
     body.appendf("Headers:\n");
     body.appendf("--------\n");

@@ -14,6 +14,7 @@ import std::collections::map;
  *>
 struct HeaderMap {
     HashMap{String, String} headers;
+    DynamicArenaAllocator arena;  // Owns all normalized header name strings
 }
 
 // Header-related faults
@@ -63,18 +64,23 @@ struct HeaderField {
 <* Initialize header map. *>
 fn void HeaderMap.init(&self, Allocator allocator = mem) {
     self.headers.init(allocator, 32);
+    // Initialize arena with 1KB pages (good for ~50 headers)
+    self.arena.init(allocator, 1024);
 }
 
 <* Free header map resources. *>
 fn void HeaderMap.free(&self) {
     self.headers.free();
+    // Free ALL normalized header name strings at once - O(1) operation!
+    self.arena.free();
 }
 
 <*
  * Convert header name to lowercase for case-insensitive comparison.
+ * Uses arena allocator for efficient batch deallocation.
  *>
-fn String normalize_header_name(String name, Allocator allocator = mem) {
-    return name.to_lower_copy(allocator);
+fn String normalize_header_name(String name, DynamicArenaAllocator* arena) {
+    return name.to_lower_copy(arena);
 }
 
 <*
@@ -124,13 +130,13 @@ fn void? HeaderMap.add(&self, String name, String value) {
         return INVALID_HEADER_VALUE?;
     }
 
-    String normalized = normalize_header_name(name);
+    String normalized = normalize_header_name(name, &self.arena);
     self.headers.set(normalized, value);
 }
 
 <* Get header value by name (case-insensitive). *>
 fn String? HeaderMap.get(&self, String name) {
-    String normalized = normalize_header_name(name);
+    String normalized = normalize_header_name(name, &self.arena);
     String*? value_ref = self.headers.get_ref(normalized);
     if (catch err = value_ref) {
         return HEADER_NOT_FOUND?;
@@ -140,13 +146,13 @@ fn String? HeaderMap.get(&self, String name) {
 
 <* Check if header exists (case-insensitive). *>
 fn bool HeaderMap.has(&self, String name) {
-    String normalized = normalize_header_name(name);
+    String normalized = normalize_header_name(name, &self.arena);
     return self.headers.has_key(normalized);
 }
 
 <* Remove header by name (case-insensitive). *>
 fn void HeaderMap.remove(&self, String name) {
-    String normalized = normalize_header_name(name);
+    String normalized = normalize_header_name(name, &self.arena);
     self.headers.remove(normalized);
 }
 
@@ -210,7 +216,7 @@ fn HeaderField? parse_header_line(String line) {
         return INVALID_HEADER_VALUE?;
     }
 
-    String name = line[..colon_pos].trim();
+    String name = line[0:colon_pos].trim();
     String value = line[colon_pos + 1..].trim();
 
     if (!is_valid_header_name(name)) {
