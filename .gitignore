@@ -31,3 +31,5 @@ vendor/
 test-results/
 
 examples/out/
+
+test/autobahn/reports

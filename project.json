@@ -23,7 +23,13 @@
   "output": "build",
   "targets": {
     "c3web": {
-      "type": "static-lib"
+      "type": "static-lib",
+      "sources": ["src/**"]
+    },
+    "autobahn_server": {
+      "type": "executable",
+      "sources": ["test/autobahn/websocket_server.c3"],
+      "link-args": ["-Lbuild", "-l:c3web.a"]
     }
   },
   "link-libc": true,

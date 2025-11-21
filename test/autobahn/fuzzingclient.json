@@ -1,0 +1,15 @@
+{
+  "outdir": "./reports",
+  "servers": [
+    {
+      "agent": "c3web WebSocket Server",
+      "url": "ws://host.docker.internal:9002",
+      "options": {
+        "version": 18
+      }
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {}
+}
