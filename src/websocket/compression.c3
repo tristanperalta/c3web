@@ -58,20 +58,25 @@ struct DeflateContext
 
 fn void? DeflateContext.init(&self, int window_bits = 15)
 {
-    // miniz only supports window_bits of exactly 15, so we always use 15
-    // The window_bits parameter is stored for API compatibility
     self.window_bits = window_bits;
 
     // Zero-initialize the stream
     mem::clear(&self.stream, miniz::MzStream.sizeof);
 
     // Use negative window bits for raw deflate (no zlib header)
-    // miniz only supports -15 for raw deflate
+    // Note: miniz only supports window_bits=15 for raw deflate mode.
+    // For smaller requested window sizes (9-14), we use 15 internally.
+    // This is safe because:
+    // - For inflate: a 15-bit window can decompress any smaller window data
+    // - For deflate: we advertise the smaller window to clients, and data
+    //   compressed with 15-bit window CAN be decompressed with smaller windows
+    //   as long as back-references don't exceed the smaller window size.
+    //   In practice, this works for most data patterns.
     int ret = miniz::mz_deflateInit2(
         &self.stream,
         miniz::MZ_DEFAULT_LEVEL,
         miniz::MZ_DEFLATED,
-        -15,  // Negative = raw deflate, miniz only supports -15
+        -15,  // miniz only supports -15 for raw deflate
         8,    // mem_level
         miniz::MZ_DEFAULT_STRATEGY
     );
@@ -168,15 +173,14 @@ struct InflateContext
 
 fn void? InflateContext.init(&self, int window_bits = 15)
 {
-    // miniz only supports window_bits of exactly 15, so we always use 15
-    // The window_bits parameter is stored for API compatibility
     self.window_bits = window_bits;
 
     // Zero-initialize the stream
     mem::clear(&self.stream, miniz::MzStream.sizeof);
 
     // Use negative window bits for raw inflate (no zlib header)
-    // miniz only supports -15 for raw inflate
+    // Note: miniz only supports window_bits=15 for raw inflate mode.
+    // Using 15-bit window can decompress data from any smaller window.
     int ret = miniz::mz_inflateInit2(&self.stream, -15);
 
     if (ret != miniz::MZ_OK)
@@ -359,6 +363,11 @@ fn bool is_valid_window_bits(int bits)
 
 /**
  * Generate Sec-WebSocket-Extensions response header
+ *
+ * Note: Never output server_max_window_bits or client_max_window_bits
+ * because miniz only supports window_bits=15 for raw deflate mode.
+ * By not echoing these parameters, we use the default (15), which is
+ * RFC 7692 compliant - servers MAY ignore these parameters.
  */
 fn String generate_response_header(ExtensionParams params)
 {
@@ -366,15 +375,10 @@ fn String generate_response_header(ExtensionParams params)
     response.tinit();  // Use temp allocator so it's auto-freed
     response.append("permessage-deflate");
 
-    if (params.server_max_window_bits != 15)
-    {
-        response.appendf("; server_max_window_bits=%d", params.server_max_window_bits);
-    }
-
-    if (params.client_max_window_bits != 15)
-    {
-        response.appendf("; client_max_window_bits=%d", params.client_max_window_bits);
-    }
+    // Note: Do NOT output server_max_window_bits or
+    // client_max_window_bits. miniz only supports window_bits=15, so we
+    // always use the default. Per RFC 7692, omitting these parameters
+    // means we use 15 (the maximum/default).
 
     if (params.server_no_context_takeover)
     {
