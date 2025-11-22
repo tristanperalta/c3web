@@ -8,6 +8,7 @@ module c3web::websocket::frame;
 
 import std::io;
 import std::core::bitorder;
+import std::core::mem;
 
 /**
  * WebSocket frame opcodes (RFC 6455 §5.2)
@@ -84,7 +85,7 @@ fn bool is_valid_opcode(Opcode opcode) @public
  * @param data - Raw frame bytes (at least 2 bytes)
  * @return Parsed frame header, or fault
  */
-fn Frame? parse_header(char[] data) @public
+fn Frame? parse_header(char[] data, bool allow_rsv1 = false) @public
 {
     if (data.len < 2)
     {
@@ -102,8 +103,9 @@ fn Frame? parse_header(char[] data) @public
     f.opcode = (Opcode)(byte0 & 0x0F);
 
     // RFC 6455 §5.2: RSV bits MUST be 0 unless extension defines meaning
-    // Since we don't support extensions, reject any non-zero RSV bits
-    if (f.rsv1 || f.rsv2 || f.rsv3)
+    // RSV1 is allowed when permessage-deflate compression is enabled (RFC 7692)
+    bool rsv1_ok = allow_rsv1 && f.rsv1 && !is_control_frame(f.opcode);
+    if ((!rsv1_ok && f.rsv1) || f.rsv2 || f.rsv3)
     {
         return INVALID_RSV_BITS?;
     }
@@ -205,10 +207,10 @@ fn void unmask_payload(char[] payload, char[4] mask_key) @public
  * @param data - Raw frame bytes (header + payload)
  * @return Parsed frame with unmasked payload, or fault
  */
-fn Frame? parse(char[] data) @public
+fn Frame? parse(char[] data, bool allow_rsv1 = false) @public
 {
     // Parse header first
-    Frame f = parse_header(data)!;
+    Frame f = parse_header(data, allow_rsv1)!;
 
     // Calculate header size to find payload offset
     ulong header_size = 2;
@@ -253,4 +255,121 @@ fn Frame? parse(char[] data) @public
     }
 
     return f;
+}
+
+/**
+ * Create a WebSocket frame
+ *
+ * @param opcode - Frame opcode
+ * @param payload - Payload data
+ * @param fin - Final frame flag
+ * @param mask - Whether to mask the payload (client->server)
+ * @return Serialized frame bytes
+ */
+fn char[] create_frame(Opcode opcode, char[] payload, bool fin, bool mask) @public
+{
+    return create_frame_with_rsv(opcode, payload, fin, mask, false, false, false);
+}
+
+/**
+ * Create a WebSocket frame with RSV bits
+ *
+ * @param opcode - Frame opcode
+ * @param payload - Payload data
+ * @param fin - Final frame flag
+ * @param mask - Whether to mask the payload (client->server)
+ * @param rsv1 - Reserved bit 1 (compression)
+ * @param rsv2 - Reserved bit 2
+ * @param rsv3 - Reserved bit 3
+ * @return Serialized frame bytes
+ */
+fn char[] create_frame_with_rsv(Opcode opcode, char[] payload, bool fin, bool mask,
+                                  bool rsv1, bool rsv2, bool rsv3) @public
+{
+    // Calculate header size
+    usz header_size = 2;
+    if (payload.len >= 126 && payload.len <= 65535)
+    {
+        header_size += 2;
+    }
+    else if (payload.len > 65535)
+    {
+        header_size += 8;
+    }
+
+    if (mask)
+    {
+        header_size += 4;
+    }
+
+    // Allocate frame buffer
+    char[] frame = mem::new_array(char, header_size + payload.len);
+
+    // Byte 0: FIN, RSV, opcode
+    frame[0] = (char)opcode;
+    if (fin) frame[0] |= 0x80;
+    if (rsv1) frame[0] |= 0x40;
+    if (rsv2) frame[0] |= 0x20;
+    if (rsv3) frame[0] |= 0x10;
+
+    // Byte 1: MASK, payload length
+    usz offset = 1;
+    if (payload.len < 126)
+    {
+        frame[1] = (char)payload.len;
+        if (mask) frame[1] |= 0x80;
+        offset = 2;
+    }
+    else if (payload.len <= 65535)
+    {
+        frame[1] = 126;
+        if (mask) frame[1] |= 0x80;
+        // Big-endian 16-bit length
+        frame[2] = (char)((payload.len >> 8) & 0xFF);
+        frame[3] = (char)(payload.len & 0xFF);
+        offset = 4;
+    }
+    else
+    {
+        frame[1] = 127;
+        if (mask) frame[1] |= 0x80;
+        // Big-endian 64-bit length
+        for (int i = 0; i < 8; i++)
+        {
+            frame[2 + i] = (char)((payload.len >> (56 - i * 8)) & 0xFF);
+        }
+        offset = 10;
+    }
+
+    // Masking key (if masked)
+    char[4] mask_key;
+    if (mask)
+    {
+        // Use simple mask for now (server frames typically don't mask)
+        // For client implementations, a proper PRNG should be used
+        mask_key[0] = 0x37;
+        mask_key[1] = 0xFA;
+        mask_key[2] = 0x21;
+        mask_key[3] = 0x3D;
+        frame[offset] = mask_key[0];
+        frame[offset + 1] = mask_key[1];
+        frame[offset + 2] = mask_key[2];
+        frame[offset + 3] = mask_key[3];
+        offset += 4;
+    }
+
+    // Copy payload (mask if needed)
+    for (usz i = 0; i < payload.len; i++)
+    {
+        if (mask)
+        {
+            frame[offset + i] = payload[i] ^ mask_key[i % 4];
+        }
+        else
+        {
+            frame[offset + i] = payload[i];
+        }
+    }
+
+    return frame;
 }

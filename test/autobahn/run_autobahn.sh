@@ -93,42 +93,30 @@ docker run --rm \
 echo ""
 echo -e "${GREEN}=== Autobahn Testsuite Complete ===${NC}"
 echo ""
-echo -e "${BLUE}Test Report:${NC}"
-echo "  HTML Report: ${AUTOBAHN_DIR}/reports/index.html"
-echo ""
 
-# Check if report exists
-if [ -f "${AUTOBAHN_DIR}/reports/index.html" ]; then
-    echo -e "${GREEN}[SUCCESS] Test report generated${NC}"
+# Check if report exists and run results checker
+if [ -f "${AUTOBAHN_DIR}/reports/index.json" ]; then
+    # Run the Python results checker for detailed analysis
+    if [ -f "${AUTOBAHN_DIR}/check_results.py" ]; then
+        python3 "${AUTOBAHN_DIR}/check_results.py" --failed --details
+    else
+        echo -e "${YELLOW}[WARN] check_results.py not found, showing basic summary${NC}"
+    fi
+
     echo ""
-    echo "To view the report:"
+    echo -e "${BLUE}Reports:${NC}"
+    echo "  HTML Report: ${AUTOBAHN_DIR}/reports/index.html"
+    echo "  JSON Report: ${AUTOBAHN_DIR}/reports/index.json"
+    echo ""
+    echo "To view detailed HTML report:"
     echo "  xdg-open ${AUTOBAHN_DIR}/reports/index.html    # Linux"
     echo "  open ${AUTOBAHN_DIR}/reports/index.html        # macOS"
     echo ""
-
-    # Try to parse results
-    if [ -f "${AUTOBAHN_DIR}/reports/c3web_WebSocket_Server/index.json" ]; then
-        echo -e "${BLUE}Quick Summary:${NC}"
-
-        # Count pass/fail (simple grep)
-        TOTAL=$(grep -o '"behavior":' "${AUTOBAHN_DIR}/reports/c3web_WebSocket_Server/index.json" | wc -l || echo "?")
-        PASS=$(grep -o '"behavior": "OK"' "${AUTOBAHN_DIR}/reports/c3web_WebSocket_Server/index.json" | wc -l || echo "0")
-        FAIL=$(grep -o '"behavior": "FAILED"' "${AUTOBAHN_DIR}/reports/c3web_WebSocket_Server/index.json" | wc -l || echo "0")
-
-        echo "  Total Tests: $TOTAL"
-        echo "  Passed: ${GREEN}$PASS${NC}"
-        echo "  Failed: ${RED}$FAIL${NC}"
-
-        if [ "$FAIL" -eq 0 ]; then
-            echo ""
-            echo -e "${GREEN}✓ All tests passed! WebSocket implementation is RFC 6455 compliant.${NC}"
-            exit 0
-        else
-            echo ""
-            echo -e "${YELLOW}⚠ Some tests failed. Review the HTML report for details.${NC}"
-            exit 1
-        fi
-    fi
+    echo "To run results checker manually:"
+    echo "  ./check_results.py              # Summary"
+    echo "  ./check_results.py --all        # All tests"
+    echo "  ./check_results.py --failed -d  # Failed tests with details"
+    echo "  ./check_results.py -c 12        # Compression tests only"
 else
     echo -e "${RED}[ERROR] Test report not generated${NC}"
     exit 1

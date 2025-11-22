@@ -1,3 +1,6 @@
 [submodule "lib/c3io.c3l"]
 	path = lib/c3io.c3l
 	url = https://github.com/tristanperalta/c3io
+[submodule "lib/miniz.c3l"]
+	path = lib/miniz.c3l
+	url = git@github.com:tristanperalta/miniz.c3l.git
