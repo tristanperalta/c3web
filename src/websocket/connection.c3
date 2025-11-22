@@ -71,6 +71,29 @@ fn void WebSocketConnection.free(&self) @public
 }
 
 /**
+ * Set maximum message size (for DoS prevention)
+ *
+ * Default is 10MB. Increase for applications needing larger messages.
+ * Autobahn test 9.1.6 requires support for 16MB messages.
+ *
+ * @param max_size - Maximum allowed message size in bytes
+ */
+fn void WebSocketConnection.set_max_message_size(&self, ulong max_size) @public
+{
+    self.msg_builder.set_max_message_size(max_size);
+}
+
+/**
+ * Get current maximum message size
+ *
+ * @return Current maximum allowed message size in bytes
+ */
+fn ulong WebSocketConnection.get_max_message_size(&self) @public
+{
+    return self.msg_builder.max_message_size;
+}
+
+/**
  * Send text message
  *
  * @param text - UTF-8 text message
@@ -245,6 +268,16 @@ fn char[]? WebSocketConnection.handle_control_frame(&self, char[] frame_data) @p
             {
                 // We haven't sent CLOSE yet - respond with CLOSE
                 self.state = State.CLOSED;
+
+                // Validate UTF-8 in close reason (RFC 6455 §5.5.1)
+                if (catch err = control::validate_close_reason(f))
+                {
+                    if (err == control::INVALID_UTF8_REASON)
+                    {
+                        // Invalid UTF-8 in close reason
+                        return control::create_close_frame(control::CLOSE_INVALID_PAYLOAD, "Invalid UTF-8 in close reason");
+                    }
+                }
 
                 // Try to extract status from incoming CLOSE
                 if (try received_status = control::parse_close_status(f))

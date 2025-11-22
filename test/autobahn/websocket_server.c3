@@ -126,6 +126,8 @@ fn void on_connection(tcp::TcpConnection* server, tcp::TcpConnection* client, vo
     WebSocketSession* session = mem::new(WebSocketSession);
     session.conn = client;
     session.ws_conn.init();
+    // Set max message size to 17MB for Autobahn test 9.1.6 (16MB text messages)
+    session.ws_conn.set_max_message_size(17 * 1024 * 1024);
     session.http_parser.init(mem);
     session.handshake_complete = false;
     session.handshake_response_writing = false;

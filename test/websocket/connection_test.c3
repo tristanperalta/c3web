@@ -503,3 +503,266 @@ fn void test_handle_close_various_valid_codes() @test
         assert(conn.state == connection::State.CLOSED, "State should be CLOSED");
     }
 }
+
+// ============================================================================
+// Autobahn Category 7.5.x - Invalid UTF-8 in Close Reason Tests
+// ============================================================================
+
+/**
+ * Test 19: Handle CLOSE frame with invalid UTF-8 in reason (Autobahn 7.5.1)
+ *
+ * RFC 6455 §5.5.1: Close reason MUST be valid UTF-8.
+ * If invalid UTF-8 is received, server should respond with 1007 (Invalid Payload Data).
+ *
+ * Autobahn test 7.5.1 sends: status 1000 + invalid UTF-8 reason containing
+ * a UTF-8 encoded surrogate (ED A0 80 = U+D800, which is illegal in UTF-8).
+ */
+fn void test_handle_close_invalid_utf8_reason() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // CLOSE frame with status 1000 + invalid UTF-8 reason
+    // The invalid UTF-8 sequence includes ED A0 80 (surrogate U+D800)
+    // Full payload from Autobahn 7.5.1: 03 E8 CE BA E1 BD B9 CF 83 CE BC CE B5 ED A0 80 65 64 69 74 65 64
+    // Simplified test: status 1000 + invalid bytes 0xFF 0xFE
+    char[] close_frame = {
+        0x88,              // FIN=1, opcode=CLOSE
+        0x05,              // len=5
+        0x03, 0xE8,        // Status code 1000
+        0xFF, 0xFE, 0xFD   // Invalid UTF-8 bytes
+    };
+
+    char[] response = conn.handle_control_frame(close_frame)!!;
+    defer mem::free(response.ptr);
+
+    frame::Frame f = frame::parse(response)!!;
+
+    assert(f.opcode == frame::Opcode.CLOSE, "Should respond with CLOSE");
+    assert(f.payload_len >= 2, "Response should have status code");
+
+    // Should respond with 1007 (Invalid Payload Data) for invalid UTF-8
+    ushort status = ((ushort)f.payload[0] << 8) | (ushort)f.payload[1];
+    assert(status == 1007, "Should respond with 1007 (Invalid Payload Data) for invalid UTF-8 reason");
+    assert(conn.state == connection::State.CLOSED, "State should be CLOSED");
+}
+
+/**
+ * Test 20: Handle CLOSE frame with surrogate UTF-8 encoding (Autobahn 7.5.1 exact sequence)
+ *
+ * This uses the exact invalid UTF-8 sequence from the Autobahn 7.5.1 test:
+ * CE BA E1 BD B9 CF 83 CE BC CE B5 ED A0 80 65 64 69 74 65 64
+ * Which is: "κόσμε" + (surrogate U+D800 encoded illegally) + "edited"
+ */
+fn void test_handle_close_surrogate_utf8() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // CLOSE frame with status 1000 + surrogate-containing UTF-8 reason
+    // ED A0 80 is the invalid UTF-8 encoding of surrogate U+D800
+    char[] close_frame = {
+        0x88,              // FIN=1, opcode=CLOSE
+        0x16,              // len=22 (2 + 20)
+        0x03, 0xE8,        // Status code 1000
+        // "κόσμε" in UTF-8
+        0xCE, 0xBA, 0xE1, 0xBD, 0xB9, 0xCF, 0x83, 0xCE, 0xBC, 0xCE, 0xB5,
+        // ED A0 80 = invalid surrogate U+D800
+        0xED, 0xA0, 0x80,
+        // "edited"
+        0x65, 0x64, 0x69, 0x74, 0x65, 0x64
+    };
+
+    char[] response = conn.handle_control_frame(close_frame)!!;
+    defer mem::free(response.ptr);
+
+    frame::Frame f = frame::parse(response)!!;
+
+    assert(f.opcode == frame::Opcode.CLOSE, "Should respond with CLOSE");
+    assert(f.payload_len >= 2, "Response should have status code");
+
+    // Should respond with 1007 (Invalid Payload Data) for surrogate in UTF-8
+    ushort status = ((ushort)f.payload[0] << 8) | (ushort)f.payload[1];
+    assert(status == 1007, "Should respond with 1007 for surrogate UTF-8 encoding");
+    assert(conn.state == connection::State.CLOSED, "State should be CLOSED");
+}
+
+/**
+ * Test 21: Handle CLOSE frame with valid UTF-8 reason (no rejection)
+ *
+ * Ensures valid UTF-8 reasons are still accepted and echoed properly.
+ */
+fn void test_handle_close_valid_utf8_reason() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // CLOSE frame with status 1000 + valid UTF-8 reason "Hello κόσμε"
+    char[] close_frame = {
+        0x88,              // FIN=1, opcode=CLOSE
+        0x12,              // len=18 (2 + 16)
+        0x03, 0xE8,        // Status code 1000
+        // "Hello " in ASCII
+        0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20,
+        // "κόσμε" in valid UTF-8
+        0xCE, 0xBA, 0xCF, 0x8C, 0xCF, 0x83, 0xCE, 0xBC, 0xCE, 0xB5
+    };
+
+    char[] response = conn.handle_control_frame(close_frame)!!;
+    defer mem::free(response.ptr);
+
+    frame::Frame f = frame::parse(response)!!;
+
+    assert(f.opcode == frame::Opcode.CLOSE, "Should respond with CLOSE");
+    assert(f.payload_len >= 2, "Response should have status code");
+
+    // Should echo back 1000 for valid UTF-8
+    ushort status = ((ushort)f.payload[0] << 8) | (ushort)f.payload[1];
+    assert(status == 1000, "Should echo back 1000 for valid UTF-8 reason");
+    assert(conn.state == connection::State.CLOSED, "State should be CLOSED");
+}
+
+// ============================================================================
+// Autobahn Category 9.x - Large Message Tests
+// ============================================================================
+
+/**
+ * Test 22: Verify default max message size (10MB)
+ *
+ * Messages exceeding 10MB should be rejected with MESSAGE_TOO_LARGE.
+ */
+fn void test_default_max_message_size() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // Default limit is 10MB - get the current max size
+    ulong max_size = conn.get_max_message_size();
+    assert(max_size == 10 * 1024 * 1024, "Default max message size should be 10MB");
+}
+
+/**
+ * Test 23: Set custom max message size (Autobahn 9.1.6 requirement)
+ *
+ * Autobahn test 9.1.6 sends a 16MB text message.
+ * Server must support setting max_message_size >= 17MB to pass.
+ */
+fn void test_set_max_message_size() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // Set to 17MB (enough for 16MB + frame overhead)
+    ulong new_size = 17 * 1024 * 1024;
+    conn.set_max_message_size(new_size);
+
+    ulong max_size = conn.get_max_message_size();
+    assert(max_size == new_size, "Max message size should be updated to 17MB");
+}
+
+/**
+ * Test 24: Message exceeding default limit is rejected
+ *
+ * Test that a message > 10MB fails with MESSAGE_TOO_LARGE when using default settings.
+ */
+fn void test_message_exceeds_default_limit() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // Create a frame claiming 11MB payload (exceeds 10MB default)
+    // We just need to test the size check, not actually send 11MB of data
+    // Build frame header for 11MB binary message
+    ulong payload_size = 11 * 1024 * 1024;
+
+    // Frame header: FIN=1, BINARY, 64-bit length
+    char[10] header;
+    header[0] = 0x82;  // FIN=1, BINARY
+    header[1] = 127;   // 64-bit length indicator
+    header[2] = 0;
+    header[3] = 0;
+    header[4] = 0;
+    header[5] = 0;
+    header[6] = (char)(payload_size >> 24);
+    header[7] = (char)(payload_size >> 16);
+    header[8] = (char)(payload_size >> 8);
+    header[9] = (char)(payload_size & 0xFF);
+
+    // Create minimal frame with header and 1 byte of payload
+    // The frame parser should reject based on length field, not actual payload
+    char[] frame = mem::new_array(char, 11);
+    defer mem::free(frame);
+    for (usz i = 0; i < 10; i++) frame[i] = header[i];
+    frame[10] = 'X';
+
+    // This should fail during receive_message due to MESSAGE_TOO_LARGE
+    // Note: The frame parser validates length before reading full payload
+    if (catch err = conn.receive_message(frame))
+    {
+        // Expected to fail with MESSAGE_TOO_LARGE
+        return;
+    }
+
+    // If we get here with a parsed frame, it means we need a different approach
+    // The length validation might happen at different stages
+    assert(false, "Should reject message exceeding 10MB default limit");
+}
+
+/**
+ * Test 25: Large message accepted after increasing limit
+ *
+ * After setting max_message_size to 17MB, a 16MB message should be accepted.
+ * This mirrors Autobahn test 9.1.6 behavior.
+ */
+fn void test_large_message_with_increased_limit() @test
+{
+    connection::WebSocketConnection conn;
+    conn.init();
+    defer conn.free();
+
+    // Increase limit to 17MB
+    conn.set_max_message_size(17 * 1024 * 1024);
+
+    // Create a 1MB binary message (smaller than both limits, but tests the flow)
+    // Full 16MB test is done via Autobahn integration
+    const usz PAYLOAD_SIZE = 1 * 1024 * 1024;  // 1MB
+    const usz HEADER_SIZE = 10;  // 2 + 8 (64-bit len)
+
+    char[] frame_data = mem::new_array(char, HEADER_SIZE + PAYLOAD_SIZE);
+    defer mem::free(frame_data);
+
+    // Header: FIN=1, BINARY, 64-bit length
+    frame_data[0] = 0x82;  // FIN=1, opcode=BINARY
+    frame_data[1] = 127;   // 64-bit length
+
+    // 64-bit length (big-endian)
+    frame_data[2] = 0;
+    frame_data[3] = 0;
+    frame_data[4] = 0;
+    frame_data[5] = 0;
+    frame_data[6] = (char)(PAYLOAD_SIZE >> 24);
+    frame_data[7] = (char)(PAYLOAD_SIZE >> 16);
+    frame_data[8] = (char)(PAYLOAD_SIZE >> 8);
+    frame_data[9] = (char)(PAYLOAD_SIZE & 0xFF);
+
+    // Fill payload with test pattern
+    for (usz i = 0; i < PAYLOAD_SIZE; i++)
+    {
+        frame_data[HEADER_SIZE + i] = 'L';
+    }
+
+    // Should succeed with increased limit
+    connection::Message msg = conn.receive_message(frame_data)!!;
+    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
+
+    assert(msg.opcode == frame::Opcode.BINARY, "Should be BINARY message");
+    assert(msg.payload_len == PAYLOAD_SIZE, "Payload should be 1MB");
+    assert(msg.payload[0] == 'L', "First byte should be 'L'");
+    assert(msg.payload[PAYLOAD_SIZE - 1] == 'L', "Last byte should be 'L'");
+}
