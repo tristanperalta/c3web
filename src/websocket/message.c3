@@ -129,8 +129,9 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
         // Track RSV1 from first frame (RFC 7692 compression indicator)
         self.message_compressed = f.rsv1;
 
-        // Validate UTF-8 for text frames
-        if (f.opcode == frame::Opcode.TEXT && f.payload_len > 0)
+        // Validate UTF-8 for text frames (skip if compressed - RSV1 set)
+        // RFC 7692: Compressed data is NOT valid UTF-8, validation happens after decompression
+        if (f.opcode == frame::Opcode.TEXT && f.payload_len > 0 && !f.rsv1)
         {
             if (!self.utf8_validator.validate_incremental(f.payload))
             {
@@ -154,8 +155,8 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
         // If FIN=1, message is complete
         if (f.fin)
         {
-            // For text frames, validate UTF-8 is complete
-            if (f.opcode == frame::Opcode.TEXT)
+            // For text frames, validate UTF-8 is complete (skip if compressed)
+            if (f.opcode == frame::Opcode.TEXT && !f.rsv1)
             {
                 if (!self.utf8_validator.is_complete())
                 {
@@ -178,8 +179,9 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
         return UNEXPECTED_DATA_FRAME?;
     }
 
-    // Validate UTF-8 for text messages
-    if (self.message_opcode == frame::Opcode.TEXT && f.payload_len > 0)
+    // Validate UTF-8 for text messages (skip if compressed)
+    // RFC 7692: message_compressed is set from RSV1 on first frame
+    if (self.message_opcode == frame::Opcode.TEXT && f.payload_len > 0 && !self.message_compressed)
     {
         if (!self.utf8_validator.validate_incremental(f.payload))
         {
@@ -203,8 +205,8 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
     // Check if message is complete
     if (f.fin)
     {
-        // For text frames, validate UTF-8 is complete
-        if (self.message_opcode == frame::Opcode.TEXT)
+        // For text frames, validate UTF-8 is complete (skip if compressed)
+        if (self.message_opcode == frame::Opcode.TEXT && !self.message_compressed)
         {
             if (!self.utf8_validator.is_complete())
             {

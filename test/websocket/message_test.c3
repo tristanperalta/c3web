@@ -401,3 +401,138 @@ fn void test_enforce_message_size_limit() @test
 
     assert(false, "Should reject message exceeding size limit");
 }
+
+/**
+ * Test 11: Skip UTF-8 validation for compressed TEXT frames (RSV1=1)
+ *
+ * RFC 7692: When permessage-deflate is negotiated, RSV1=1 indicates compressed data.
+ * Compressed data is NOT valid UTF-8, so UTF-8 validation must be skipped during
+ * message assembly. Validation should happen AFTER decompression by the application.
+ */
+fn void test_skip_utf8_validation_for_compressed_text() @test
+{
+    message::MessageBuilder builder;
+    builder.init();
+    defer builder.free();
+
+    // Simulate compressed TEXT frame with RSV1=1
+    // Compressed data is NOT valid UTF-8 - it's deflate-compressed binary
+    // Example: compressed "Hello" might look like binary garbage
+    char[] compressed_payload = {0x78, 0x9C, 0xCB, 0x48, 0xCD, 0xC9};  // zlib compressed bytes
+
+    frame::Frame f;
+    f.fin = true;
+    f.opcode = frame::Opcode.TEXT;
+    f.rsv1 = true;  // Compression flag
+    f.payload = compressed_payload;
+    f.payload_len = compressed_payload.len;
+
+    // This should succeed because UTF-8 validation is skipped for compressed messages
+    bool complete = builder.add_frame(f)!!;
+    assert(complete, "Compressed TEXT frame should be accepted without UTF-8 validation");
+
+    message::Message msg = builder.get_message()!!;
+    assert(msg.compressed, "Message should be marked as compressed");
+    assert(msg.opcode == frame::Opcode.TEXT, "Opcode should be TEXT");
+}
+
+/**
+ * Test 12: Skip UTF-8 validation for fragmented compressed TEXT frames
+ *
+ * Compressed TEXT frames can be fragmented. UTF-8 validation should be skipped
+ * for ALL fragments when RSV1=1 on the first frame.
+ */
+fn void test_skip_utf8_validation_for_fragmented_compressed_text() @test
+{
+    message::MessageBuilder builder;
+    builder.init();
+    defer builder.free();
+
+    // Fragment 1: Start of compressed TEXT (FIN=0, RSV1=1)
+    char[] frag1 = {0x78, 0x9C, 0xCB};  // zlib header + some bytes
+
+    frame::Frame f1;
+    f1.fin = false;
+    f1.opcode = frame::Opcode.TEXT;
+    f1.rsv1 = true;  // Compression flag on first frame
+    f1.payload = frag1;
+    f1.payload_len = frag1.len;
+
+    builder.add_frame(f1)!!;
+
+    // Fragment 2: Continuation with more compressed bytes (FIN=1, RSV1=0)
+    char[] frag2 = {0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00};
+
+    frame::Frame f2;
+    f2.fin = true;
+    f2.opcode = frame::Opcode.CONTINUATION;
+    f2.rsv1 = false;  // RSV1 only on first frame per RFC 7692
+    f2.payload = frag2;
+    f2.payload_len = frag2.len;
+
+    bool complete = builder.add_frame(f2)!!;
+    assert(complete, "Fragmented compressed TEXT should complete successfully");
+
+    message::Message msg = builder.get_message()!!;
+    assert(msg.compressed, "Message should be marked as compressed");
+    assert(msg.payload_len == 9, "Total payload should be 9 bytes");
+}
+
+/**
+ * Test 13: Non-compressed TEXT frames still require UTF-8 validation
+ *
+ * When RSV1=0 (no compression), TEXT frames must contain valid UTF-8.
+ */
+fn void test_utf8_validation_required_for_uncompressed_text() @test
+{
+    message::MessageBuilder builder;
+    builder.init();
+    defer builder.free();
+
+    // Invalid UTF-8 sequence (0xFF is never valid in UTF-8)
+    char[] invalid_utf8 = {'H', 'e', 0xFF, 'l', 'o'};
+
+    frame::Frame f;
+    f.fin = true;
+    f.opcode = frame::Opcode.TEXT;
+    f.rsv1 = false;  // NOT compressed
+    f.payload = invalid_utf8;
+    f.payload_len = invalid_utf8.len;
+
+    // This should fail because UTF-8 validation catches the invalid sequence
+    if (catch builder.add_frame(f))
+    {
+        // Expected to fail with INVALID_UTF8
+        return;
+    }
+
+    assert(false, "Uncompressed TEXT with invalid UTF-8 should be rejected");
+}
+
+/**
+ * Test 14: BINARY frames never require UTF-8 validation
+ *
+ * BINARY frames (opcode 0x02) can contain any data, regardless of RSV1.
+ */
+fn void test_binary_frames_skip_utf8_validation() @test
+{
+    message::MessageBuilder builder;
+    builder.init();
+    defer builder.free();
+
+    // Any bytes are valid in BINARY frames
+    char[] binary_payload = {0xFF, 0xFE, 0x00, 0x01, 0x80, 0xC0};
+
+    frame::Frame f;
+    f.fin = true;
+    f.opcode = frame::Opcode.BINARY;
+    f.rsv1 = false;  // Even without compression
+    f.payload = binary_payload;
+    f.payload_len = binary_payload.len;
+
+    bool complete = builder.add_frame(f)!!;
+    assert(complete, "BINARY frame with any data should be accepted");
+
+    message::Message msg = builder.get_message()!!;
+    assert(msg.opcode == frame::Opcode.BINARY, "Opcode should be BINARY");
+}

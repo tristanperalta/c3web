@@ -12,6 +12,7 @@ import c3web::websocket::frame;
 import c3web::websocket::control;
 import c3web::websocket::message;
 import c3web::websocket::compression;
+import c3web::websocket::utf8;
 import c3web::http1::parser;
 import async::event_loop;
 import async::tcp;
@@ -448,6 +449,20 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                         }
                         payload_to_echo = decompressed;
                         // Decompressed payload needs to be freed later
+
+                        // Validate UTF-8 for TEXT messages after decompression (RFC 7692)
+                        if (msg.opcode == frame::Opcode.TEXT && payload_to_echo.len > 0)
+                        {
+                            utf8::Utf8Validator validator;
+                            validator.init();
+                            if (!validator.validate_incremental(payload_to_echo) || !validator.is_complete())
+                            {
+                                io::eprintfn("[%d] Invalid UTF-8 in decompressed text message", session.session_id);
+                                mem::free(payload_to_echo.ptr);
+                                send_close_and_release(session, control::CLOSE_INVALID_PAYLOAD, "Invalid UTF-8");
+                                return;
+                            }
+                        }
                     }
                     else if (catch decomp_err = session.pmd.decompress_message(msg.payload))
                     {
