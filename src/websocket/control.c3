@@ -33,7 +33,7 @@ const ushort CLOSE_TLS_HANDSHAKE_FAIL = 1015;  // Reserved: TLS handshake failur
  * Control frame errors
  */
 faultdef CONTROL_PAYLOAD_TOO_LARGE, INVALID_CLOSE_STATUS, INVALID_UTF8_REASON,
-         INVALID_FRAME_FORMAT;
+         INVALID_FRAME_FORMAT, INVALID_CLOSE_PAYLOAD;
 
 /**
  * Validate close status code
@@ -237,9 +237,12 @@ fn char[]? create_pong_frame(char[] payload) @public
  * Parse status code from CLOSE frame
  *
  * RFC 6455 §5.5.1: First 2 bytes of payload are status code
+ * RFC 6455 §7.1.6: Close frame body must be 0 bytes OR 2+ bytes
  *
  * @param f - Parsed CLOSE frame
- * @return Status code
+ * @return Status code, or fault:
+ *         - INVALID_FRAME_FORMAT: Empty payload (0 bytes) - valid, no status code
+ *         - INVALID_CLOSE_PAYLOAD: Invalid payload length (1 byte) - protocol error
  */
 fn ushort? parse_close_status(frame::Frame f) @public
 {
@@ -248,10 +251,17 @@ fn ushort? parse_close_status(frame::Frame f) @public
         return INVALID_FRAME_FORMAT?;
     }
 
-    // CLOSE frame with no payload means no status code (abnormal)
-    if (f.payload_len < 2)
+    // CLOSE frame with no payload means no status code (valid per RFC 6455)
+    if (f.payload_len == 0)
     {
         return INVALID_FRAME_FORMAT?;
+    }
+
+    // CLOSE frame with 1 byte payload is invalid (RFC 6455 §7.1.6)
+    // Must be 0 bytes OR 2+ bytes (status code + optional reason)
+    if (f.payload_len == 1)
+    {
+        return INVALID_CLOSE_PAYLOAD?;
     }
 
     // Extract status code (network byte order)

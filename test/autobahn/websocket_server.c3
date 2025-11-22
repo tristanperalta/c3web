@@ -15,11 +15,14 @@ import c3web::http1::parser;
 import async::event_loop;
 import async::tcp;
 import std::io;
+import std::atomic;
+import std::thread;
 
 const ushort SERVER_PORT = 9002;
 
 struct WebSocketSession
 {
+    Atomic{int} refcount;  // Thread-safe reference counting (freed when refcount hits -1)
     tcp::TcpConnection* conn;
     connection::WebSocketConnection ws_conn;
     parser::Parser http_parser;
@@ -28,6 +31,40 @@ struct WebSocketSession
     int session_id;
     DString pipelined_buffer;  // Buffer for data received during handshake write
     DString frame_buffer;      // Buffer for incomplete WebSocket frames (TCP fragmentation)
+}
+
+/**
+ * Retain - increment reference count
+ */
+fn void WebSocketSession.retain(&self)
+{
+    self.refcount.add(1, RELAXED);
+}
+
+/**
+ * Release - decrement reference count, cleanup when it reaches -1
+ */
+fn void WebSocketSession.release(&self)
+{
+    if (self.refcount.sub(1, RELAXED) == 0)
+    {
+        thread::fence(ACQUIRE);
+        self.dealloc();
+    }
+}
+
+/**
+ * Custom cleanup - called when refcount reaches -1
+ */
+fn void WebSocketSession.dealloc(&self)
+{
+    io::printfn("[%d] Session refcount reached 0, cleaning up", self.session_id);
+    self.ws_conn.free();
+    self.http_parser.free();
+    self.pipelined_buffer.free();
+    self.frame_buffer.free();
+    self.conn.close();
+    mem::free(self);
 }
 
 int global_session_id = 0;
@@ -83,6 +120,7 @@ fn void on_connection(tcp::TcpConnection* server, tcp::TcpConnection* client, vo
     session.handshake_complete = false;
     session.handshake_response_writing = false;
     session.session_id = ++global_session_id;
+    // RefCounted starts at 0 (valid), freed at -1. We hold one reference for the read callback.
     session.pipelined_buffer = dstring::new(mem);
     session.frame_buffer = dstring::new(mem);
 
@@ -111,7 +149,7 @@ fn void on_read(tcp::TcpConnection* conn, char[] data, void* user_data)
     if (data.len == 0)
     {
         io::printfn("[%d] Client disconnected (EOF)", session.session_id);
-        cleanup_session(session);
+        session.release();
         return;
     }
 
@@ -152,7 +190,7 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
     {
         io::eprintfn("[%d] Invalid handshake: %s", session.session_id, err);
         send_http_error(session, 400, "Bad Request");
-        cleanup_session(session);
+        session.release();
         return;
     }
 
@@ -169,7 +207,7 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
     {
         io::eprintfn("[%d] Invalid WebSocket upgrade request", session.session_id);
         send_http_error(session, 400, "Bad Request");
-        cleanup_session(session);
+        session.release();
         return;
     }
 
@@ -178,7 +216,7 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
     if (catch ws_key)
     {
         send_http_error(session, 400, "Missing Sec-WebSocket-Key");
-        cleanup_session(session);
+        session.release();
         return;
     }
 
@@ -190,7 +228,7 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
     {
         io::eprintfn("[%d] Failed to generate accept key: %s", session.session_id, err);
         send_http_error(session, 500, "Internal Server Error");
-        cleanup_session(session);
+        session.release();
         return;
     }
 
@@ -218,6 +256,7 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
 
     // Mark that we're writing the handshake - will set handshake_complete in callback
     session.handshake_response_writing = true;
+    session.retain();  // +1 ref for write callback
     session.conn.write(response_bytes, &on_handshake_write_complete, session)!!;
 }
 
@@ -245,7 +284,7 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
             }
             // Other header error - protocol violation, send close with 1002
             io::eprintfn("[%d] Frame header error: %s", session.session_id, header_err);
-            send_close_and_cleanup(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
+            send_close_and_release(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
             return;
         }
 
@@ -289,10 +328,12 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
             {
                 if (control_response.len > 0)
                 {
+                    session.retain();  // +1 ref for write callback
                     if (catch err = session.conn.write(control_response, &on_write_complete, session))
                     {
                         io::eprintfn("[%d] Control frame write failed: %s", session.session_id, err);
-                        cleanup_session(session);
+                        session.release();  // Release the ref we just took
+                        session.release();  // Release main ref
                         return;
                     }
                 }
@@ -301,14 +342,14 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                 if (session.ws_conn.state == connection::State.CLOSED)
                 {
                     io::printfn("[%d] WebSocket close handshake complete", session.session_id);
-                    cleanup_session(session);
+                    session.release();
                     return;
                 }
             }
             else if (catch control_err = session.ws_conn.handle_control_frame(frame_data))
             {
                 io::eprintfn("[%d] Error handling control frame: %s", session.session_id, control_err);
-                send_close_and_cleanup(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
+                send_close_and_release(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
                 return;
             }
         }
@@ -329,13 +370,13 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                 {
                     // UTF-8 validation error - use 1007
                     io::eprintfn("[%d] Invalid UTF-8 in text message", session.session_id);
-                    send_close_and_cleanup(session, control::CLOSE_INVALID_PAYLOAD, "Invalid UTF-8");
+                    send_close_and_release(session, control::CLOSE_INVALID_PAYLOAD, "Invalid UTF-8");
                     return;
                 }
                 else
                 {
                     io::eprintfn("[%d] Error receiving message: %s", session.session_id, msg_err);
-                    send_close_and_cleanup(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
+                    send_close_and_release(session, control::CLOSE_PROTOCOL_ERROR, "Protocol error");
                     return;
                 }
             }
@@ -357,15 +398,17 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                 if (catch err = echo_frame)
                 {
                     io::eprintfn("[%d] Failed to create echo frame: %s", session.session_id, err);
-                    cleanup_session(session);
+                    session.release();
                     return;
                 }
 
                 // Send echo
+                session.retain();  // +1 ref for write callback
                 if (catch err = session.conn.write(echo_frame, &on_write_complete, session))
                 {
                     io::eprintfn("[%d] Write failed: %s", session.session_id, err);
-                    cleanup_session(session);
+                    session.release();  // Release the ref we just took
+                    session.release();  // Release main ref
                     return;
                 }
 
@@ -400,12 +443,12 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
 fn void on_handshake_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
 {
     WebSocketSession* session = (WebSocketSession*)user_data;
+    defer session.release();  // Always release write callback ref
 
     if (status < 0)
     {
         io::eprintfn("[%d] Handshake write error", session.session_id);
-        cleanup_session(session);
-        return;
+        return;  // defer will release
     }
 
     // Handshake response has been sent - now we can accept WebSocket frames
@@ -435,11 +478,14 @@ fn void on_handshake_write_complete(tcp::TcpConnection* conn, int status, void* 
  */
 fn void on_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
 {
+    WebSocketSession* session = (WebSocketSession*)user_data;
+    defer session.release();  // Always release write callback ref
+
     if (status < 0)
     {
-        WebSocketSession* session = (WebSocketSession*)user_data;
         io::eprintfn("[%d] Write error", session.session_id);
-        cleanup_session(session);
+        // defer will release the write callback ref
+        // No need to explicitly release main ref - the read callback or other callbacks will handle it
     }
 }
 
@@ -458,29 +504,28 @@ fn void send_http_error(WebSocketSession* session, ushort status, String status_
     response.append("\r\n");
     response.append(status_text);
 
+    session.retain();  // +1 ref for write callback
     session.conn.write((char[])response.str_view(), &on_write_complete, session)!!;
 }
 
 /**
- * Send a close frame with the given status code and then cleanup
+ * Send a close frame with the given status code and release main ref
  */
-fn void send_close_and_cleanup(WebSocketSession* session, ushort status_code, String reason)
+fn void send_close_and_release(WebSocketSession* session, ushort status_code, String reason)
 {
     if (try close_frame = control::create_close_frame(status_code, reason))
     {
         io::printfn("[%d] Sending close frame with code %d: %s", session.session_id, status_code, reason);
-        // Send close frame, then cleanup in callback
+        // Send close frame, then release in callback
+        session.retain();  // +1 ref for close write callback
         if (catch err = session.conn.write(close_frame, &on_close_write_complete, session))
         {
             io::eprintfn("[%d] Failed to send close frame: %s", session.session_id, err);
-            cleanup_session(session);
+            session.release();  // Release the ref we just took
         }
     }
-    else
-    {
-        // Failed to create close frame, just cleanup
-        cleanup_session(session);
-    }
+    // Release main reference (read callback ref)
+    session.release();
 }
 
 /**
@@ -489,19 +534,7 @@ fn void send_close_and_cleanup(WebSocketSession* session, ushort status_code, St
 fn void on_close_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
 {
     WebSocketSession* session = (WebSocketSession*)user_data;
-    io::printfn("[%d] Close frame sent, cleaning up", session.session_id);
-    cleanup_session(session);
+    io::printfn("[%d] Close frame sent, releasing ref", session.session_id);
+    session.release();  // Release close write callback ref
 }
 
-/**
- * Clean up session
- */
-fn void cleanup_session(WebSocketSession* session)
-{
-    session.ws_conn.free();
-    session.http_parser.free();
-    session.pipelined_buffer.free();
-    session.frame_buffer.free();
-    session.conn.close();
-    mem::free(session);
-}

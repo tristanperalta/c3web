@@ -251,18 +251,24 @@ fn char[]? WebSocketConnection.handle_control_frame(&self, char[] frame_data) @p
                     // Echo back the same status code
                     return control::create_close_frame(received_status, "");
                 }
-                else
+
+                // parse_close_status failed - check why
+                if (catch err = control::parse_close_status(f))
                 {
-                    // No status code in received CLOSE - respond with empty CLOSE
-                    return control::create_empty_close_frame();
+                    if (err == control::INVALID_CLOSE_PAYLOAD)
+                    {
+                        // Invalid close frame payload (1 byte) - protocol error
+                        return control::create_close_frame(control::CLOSE_PROTOCOL_ERROR, "Invalid close frame payload");
+                    }
                 }
+
+                // No status code in received CLOSE (empty payload) - respond with empty CLOSE
+                return control::create_empty_close_frame();
             }
-            else
-            {
-                // We already sent CLOSE, now received response - close complete
-                self.state = State.CLOSED;
-                return {}; // No response needed
-            }
+
+            // We already sent CLOSE, now received response - close complete
+            self.state = State.CLOSED;
+            return {}; // No response needed
 
         default:
             return INVALID_STATE?;
