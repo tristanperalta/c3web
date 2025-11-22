@@ -1,0 +1,885 @@
+/**
+ * HTTP/2 Test Server for h2spec Conformance Testing
+ *
+ * Minimal HTTP/2 server implementation using c3io async event loop.
+ * This server will be expanded as the HTTP/2 implementation progresses.
+ *
+ * Current capabilities:
+ * - Connection preface validation ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+ * - SETTINGS frame exchange
+ * - PING/PONG handling
+ * - GOAWAY for graceful shutdown
+ *
+ * RFC 9113 compliant where implemented.
+ */
+module c3web::test::h2spec::server;
+
+import async::event_loop;
+import async::tcp;
+import std::io;
+import std::atomic;
+import std::thread;
+
+const ushort SERVER_PORT = 8080;
+
+// HTTP/2 Connection Preface (RFC 9113 §3.4)
+// Client must send this first, followed by a SETTINGS frame
+const char[24] CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+// Frame Types (RFC 9113 §6)
+const char FRAME_DATA          = 0x0;
+const char FRAME_HEADERS       = 0x1;
+const char FRAME_PRIORITY      = 0x2;
+const char FRAME_RST_STREAM    = 0x3;
+const char FRAME_SETTINGS      = 0x4;
+const char FRAME_PUSH_PROMISE  = 0x5;
+const char FRAME_PING          = 0x6;
+const char FRAME_GOAWAY        = 0x7;
+const char FRAME_WINDOW_UPDATE = 0x8;
+const char FRAME_CONTINUATION  = 0x9;
+
+// Frame Flags
+const char FLAG_ACK        = 0x1;  // For SETTINGS and PING
+const char FLAG_END_STREAM = 0x1;  // For DATA and HEADERS
+const char FLAG_END_HEADERS = 0x4; // For HEADERS
+const char FLAG_PADDED     = 0x8;
+const char FLAG_PRIORITY   = 0x20;
+
+// Error Codes (RFC 9113 §7)
+const uint ERR_NO_ERROR            = 0x0;
+const uint ERR_PROTOCOL_ERROR      = 0x1;
+const uint ERR_INTERNAL_ERROR      = 0x2;
+const uint ERR_FLOW_CONTROL_ERROR  = 0x3;
+const uint ERR_SETTINGS_TIMEOUT    = 0x4;
+const uint ERR_STREAM_CLOSED       = 0x5;
+const uint ERR_FRAME_SIZE_ERROR    = 0x6;
+const uint ERR_REFUSED_STREAM      = 0x7;
+const uint ERR_CANCEL              = 0x8;
+const uint ERR_COMPRESSION_ERROR   = 0x9;
+const uint ERR_CONNECT_ERROR       = 0xa;
+const uint ERR_ENHANCE_YOUR_CALM   = 0xb;
+const uint ERR_INADEQUATE_SECURITY = 0xc;
+const uint ERR_HTTP_1_1_REQUIRED   = 0xd;
+
+// Settings Identifiers (RFC 9113 §6.5.2)
+const ushort SETTINGS_HEADER_TABLE_SIZE      = 0x1;
+const ushort SETTINGS_ENABLE_PUSH            = 0x2;
+const ushort SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
+const ushort SETTINGS_INITIAL_WINDOW_SIZE    = 0x4;
+const ushort SETTINGS_MAX_FRAME_SIZE         = 0x5;
+const ushort SETTINGS_MAX_HEADER_LIST_SIZE   = 0x6;
+
+// Default Settings Values
+const uint DEFAULT_HEADER_TABLE_SIZE      = 4096;
+const uint DEFAULT_ENABLE_PUSH            = 1;
+const uint DEFAULT_MAX_CONCURRENT_STREAMS = 100;  // Unlimited by default, but we set a reasonable limit
+const uint DEFAULT_INITIAL_WINDOW_SIZE    = 65535;
+const uint DEFAULT_MAX_FRAME_SIZE         = 16384;
+const uint MAX_FRAME_SIZE_LIMIT           = 16777215;  // 2^24 - 1
+
+enum ConnectionState
+{
+    AWAITING_PREFACE,
+    AWAITING_SETTINGS,
+    OPEN,
+    CLOSING,
+    CLOSED
+}
+
+struct H2Session
+{
+    Atomic{int} refcount;
+    tcp::TcpConnection* conn;
+    ConnectionState state;
+    int session_id;
+
+    // Receive buffer for handling TCP fragmentation
+    DString recv_buffer;
+    usz preface_bytes_received;
+
+    // Settings (local = what we advertise, remote = what peer advertises)
+    uint local_max_frame_size;
+    uint local_initial_window_size;
+    uint local_max_concurrent_streams;
+    uint remote_max_frame_size;
+    uint remote_initial_window_size;
+
+    // Flow control
+    int connection_window;  // Connection-level flow control window
+
+    // State tracking
+    bool settings_ack_sent;
+    bool settings_ack_received;
+    uint last_stream_id;  // Last stream ID processed (for GOAWAY)
+}
+
+fn void H2Session.retain(&self)
+{
+    self.refcount.add(1, RELAXED);
+}
+
+fn void H2Session.release(&self)
+{
+    if (self.refcount.sub(1, RELAXED) == 0)
+    {
+        thread::fence(ACQUIRE);
+        self.dealloc();
+    }
+}
+
+fn void H2Session.dealloc(&self)
+{
+    io::printfn("[%d] Session cleanup", self.session_id);
+    self.recv_buffer.free();
+    self.conn.close();
+    mem::free(self);
+}
+
+fn void H2Session.init(&self)
+{
+    self.state = ConnectionState.AWAITING_PREFACE;
+    self.recv_buffer = dstring::new(mem);
+    self.preface_bytes_received = 0;
+
+    // Initialize with default settings
+    self.local_max_frame_size = DEFAULT_MAX_FRAME_SIZE;
+    self.local_initial_window_size = DEFAULT_INITIAL_WINDOW_SIZE;
+    self.local_max_concurrent_streams = DEFAULT_MAX_CONCURRENT_STREAMS;
+    self.remote_max_frame_size = DEFAULT_MAX_FRAME_SIZE;
+    self.remote_initial_window_size = DEFAULT_INITIAL_WINDOW_SIZE;
+
+    self.connection_window = (int)DEFAULT_INITIAL_WINDOW_SIZE;
+    self.settings_ack_sent = false;
+    self.settings_ack_received = false;
+    self.last_stream_id = 0;
+}
+
+int global_session_id = 0;
+
+fn int main()
+{
+    io::printn("Starting HTTP/2 Test Server for h2spec...");
+    io::printfn("Listening on http://0.0.0.0:%d", SERVER_PORT);
+
+    // Create event loop
+    event_loop::EventLoop? loop_opt = event_loop::create();
+    if (catch err = loop_opt)
+    {
+        io::eprintfn("[ERROR] Failed to create event loop: %s", err);
+        return 1;
+    }
+    event_loop::EventLoop loop = loop_opt;
+    defer loop.free();
+
+    // Create TCP server
+    tcp::TcpConnection*? server_opt = tcp::create(&loop);
+    if (catch err = server_opt)
+    {
+        io::eprintfn("[ERROR] Failed to create server: %s", err);
+        return 1;
+    }
+    tcp::TcpConnection* server = server_opt;
+    defer server.close();
+
+    // Bind and listen
+    server.bind("0.0.0.0", SERVER_PORT)!!;
+    server.listen(128, &on_connection)!!;
+
+    io::printn("[READY] Server listening - waiting for h2spec connections");
+    io::stdout().flush()!!;
+
+    // Run event loop
+    loop.run()!!;
+
+    return 0;
+}
+
+fn void on_connection(tcp::TcpConnection* server, tcp::TcpConnection* client, void* user_data)
+{
+    H2Session* session = mem::new(H2Session);
+    session.conn = client;
+    session.init();
+    session.session_id = ++global_session_id;
+
+    io::printfn("[%d] New HTTP/2 connection", session.session_id);
+
+    // Start reading
+    client.start_read(&on_alloc, &on_read, session)!!;
+
+    // Send our SETTINGS frame immediately (server preface)
+    send_settings_frame(session);
+}
+
+fn char[] on_alloc(tcp::TcpConnection* conn, usz suggested_size, void* user_data)
+{
+    return mem::new_array(char, suggested_size);
+}
+
+fn void on_read(tcp::TcpConnection* conn, char[] data, void* user_data)
+{
+    H2Session* session = (H2Session*)user_data;
+
+    if (data.len == 0)
+    {
+        io::printfn("[%d] Client disconnected (EOF)", session.session_id);
+        session.release();
+        return;
+    }
+
+    // Append to receive buffer
+    session.recv_buffer.append(data);
+
+    // Process based on state
+    switch (session.state)
+    {
+        case AWAITING_PREFACE:
+            process_preface(session);
+        case AWAITING_SETTINGS:
+        case OPEN:
+            process_frames(session);
+        case CLOSING:
+        case CLOSED:
+            // Ignore data in closing/closed states
+            return;
+    }
+}
+
+/**
+ * Validate HTTP/2 connection preface
+ */
+fn void process_preface(H2Session* session)
+{
+    char[] buffer = (char[])session.recv_buffer.str_view();
+
+    // Need at least 24 bytes for the preface
+    if (buffer.len < CONNECTION_PREFACE.len)
+    {
+        return;  // Wait for more data
+    }
+
+    // Validate preface
+    if (buffer[:CONNECTION_PREFACE.len] != CONNECTION_PREFACE[..])
+    {
+        io::eprintfn("[%d] Invalid connection preface", session.session_id);
+        send_goaway(session, 0, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    io::printfn("[%d] Valid connection preface received", session.session_id);
+
+    // Remove preface from buffer
+    session.recv_buffer = dstring::new(mem);
+    if (buffer.len > CONNECTION_PREFACE.len)
+    {
+        session.recv_buffer.append(buffer[CONNECTION_PREFACE.len..]);
+    }
+
+    // Move to next state - awaiting client's SETTINGS frame
+    session.state = ConnectionState.AWAITING_SETTINGS;
+
+    // Continue processing (client SETTINGS should follow)
+    process_frames(session);
+}
+
+/**
+ * Process HTTP/2 frames from buffer
+ */
+fn void process_frames(H2Session* session)
+{
+    while (true)
+    {
+        char[] buffer = (char[])session.recv_buffer.str_view();
+
+        // Need at least 9 bytes for frame header
+        if (buffer.len < 9)
+        {
+            return;  // Wait for more data
+        }
+
+        // Parse frame header (RFC 9113 §4.1)
+        // Length: 24 bits, Type: 8 bits, Flags: 8 bits, Stream ID: 31 bits (R bit reserved)
+        uint length = ((uint)buffer[0] << 16) | ((uint)buffer[1] << 8) | (uint)buffer[2];
+        char frame_type = buffer[3];
+        char flags = buffer[4];
+        uint stream_id = ((uint)(buffer[5] & 0x7F) << 24) | ((uint)buffer[6] << 16) |
+                        ((uint)buffer[7] << 8) | (uint)buffer[8];
+
+        // Validate frame size
+        if (length > session.local_max_frame_size)
+        {
+            io::eprintfn("[%d] Frame size %d exceeds max %d", session.session_id, length, session.local_max_frame_size);
+            send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+            return;
+        }
+
+        // Check if we have the complete frame
+        usz total_frame_len = 9 + (usz)length;
+        if (buffer.len < total_frame_len)
+        {
+            return;  // Wait for more data
+        }
+
+        // Extract frame payload
+        char[] payload = buffer[9..][:length];
+
+        io::printfn("[%d] Frame: type=%d flags=0x%02x stream=%d len=%d",
+                    session.session_id, frame_type, flags, stream_id, length);
+
+        // Handle frame by type
+        switch (frame_type)
+        {
+            case FRAME_SETTINGS:
+                handle_settings(session, flags, stream_id, payload);
+            case FRAME_PING:
+                handle_ping(session, flags, stream_id, payload);
+            case FRAME_GOAWAY:
+                handle_goaway(session, payload);
+            case FRAME_WINDOW_UPDATE:
+                handle_window_update(session, stream_id, payload);
+            case FRAME_HEADERS:
+                handle_headers(session, flags, stream_id, payload);
+            case FRAME_DATA:
+                handle_data(session, flags, stream_id, payload);
+            case FRAME_RST_STREAM:
+                handle_rst_stream(session, stream_id, payload);
+            case FRAME_PRIORITY:
+                // PRIORITY frames are parsed but ignored (RFC 9113 deprecates them)
+                io::printfn("[%d] PRIORITY frame (ignored)", session.session_id);
+            case FRAME_CONTINUATION:
+                // TODO: Implement CONTINUATION handling
+                io::printfn("[%d] CONTINUATION frame (not implemented)", session.session_id);
+            default:
+                // Unknown frame types are ignored (RFC 9113 §4.1)
+                io::printfn("[%d] Unknown frame type %d (ignored)", session.session_id, frame_type);
+        }
+
+        // Remove processed frame from buffer
+        if (buffer.len > total_frame_len)
+        {
+            DString new_buffer = dstring::new(mem);
+            new_buffer.append(buffer[total_frame_len..]);
+            session.recv_buffer.free();
+            session.recv_buffer = new_buffer;
+        }
+        else
+        {
+            session.recv_buffer.clear();
+        }
+
+        // Check if connection is closing
+        if (session.state == ConnectionState.CLOSING || session.state == ConnectionState.CLOSED)
+        {
+            return;
+        }
+    }
+}
+
+/**
+ * Handle SETTINGS frame (RFC 9113 §6.5)
+ */
+fn void handle_settings(H2Session* session, char flags, uint stream_id, char[] payload)
+{
+    // SETTINGS must be on stream 0
+    if (stream_id != 0)
+    {
+        io::eprintfn("[%d] SETTINGS on non-zero stream", session.session_id);
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    // Check for ACK flag
+    if (flags & FLAG_ACK)
+    {
+        // SETTINGS ACK must have empty payload
+        if (payload.len != 0)
+        {
+            io::eprintfn("[%d] SETTINGS ACK with non-empty payload", session.session_id);
+            send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+            return;
+        }
+        io::printfn("[%d] Received SETTINGS ACK", session.session_id);
+        session.settings_ack_received = true;
+        return;
+    }
+
+    // SETTINGS payload must be multiple of 6 bytes
+    if (payload.len % 6 != 0)
+    {
+        io::eprintfn("[%d] SETTINGS payload not multiple of 6", session.session_id);
+        send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+        return;
+    }
+
+    // Parse settings
+    for (usz i = 0; i < payload.len; i += 6)
+    {
+        ushort id = ((ushort)payload[i] << 8) | (ushort)payload[i + 1];
+        uint value = ((uint)payload[i + 2] << 24) | ((uint)payload[i + 3] << 16) |
+                     ((uint)payload[i + 4] << 8) | (uint)payload[i + 5];
+
+        io::printfn("[%d] Setting: id=%d value=%d", session.session_id, id, value);
+
+        switch (id)
+        {
+            case SETTINGS_HEADER_TABLE_SIZE:
+                // TODO: Update HPACK encoder table size
+                break;
+            case SETTINGS_ENABLE_PUSH:
+                if (value > 1)
+                {
+                    send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                    return;
+                }
+                break;
+            case SETTINGS_MAX_CONCURRENT_STREAMS:
+                // Store for stream management
+                break;
+            case SETTINGS_INITIAL_WINDOW_SIZE:
+                if (value > 2147483647)  // 2^31 - 1
+                {
+                    send_goaway(session, session.last_stream_id, ERR_FLOW_CONTROL_ERROR);
+                    return;
+                }
+                session.remote_initial_window_size = value;
+                break;
+            case SETTINGS_MAX_FRAME_SIZE:
+                if (value < DEFAULT_MAX_FRAME_SIZE || value > MAX_FRAME_SIZE_LIMIT)
+                {
+                    send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                    return;
+                }
+                session.remote_max_frame_size = value;
+                break;
+            case SETTINGS_MAX_HEADER_LIST_SIZE:
+                // Advisory, store for header validation
+                break;
+            default:
+                // Unknown settings are ignored (RFC 9113 §6.5.2)
+                break;
+        }
+    }
+
+    // Update state if we were waiting for SETTINGS
+    if (session.state == ConnectionState.AWAITING_SETTINGS)
+    {
+        session.state = ConnectionState.OPEN;
+        io::printfn("[%d] Connection established (OPEN)", session.session_id);
+    }
+
+    // Send SETTINGS ACK
+    send_settings_ack(session);
+}
+
+/**
+ * Handle PING frame (RFC 9113 §6.7)
+ */
+fn void handle_ping(H2Session* session, char flags, uint stream_id, char[] payload)
+{
+    // PING must be on stream 0
+    if (stream_id != 0)
+    {
+        io::eprintfn("[%d] PING on non-zero stream", session.session_id);
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    // PING payload must be 8 bytes
+    if (payload.len != 8)
+    {
+        io::eprintfn("[%d] PING with invalid payload length %d", session.session_id, payload.len);
+        send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+        return;
+    }
+
+    // If ACK flag set, this is a response to our PING
+    if (flags & FLAG_ACK)
+    {
+        io::printfn("[%d] Received PING ACK", session.session_id);
+        return;
+    }
+
+    // Send PING ACK with same opaque data
+    io::printfn("[%d] Sending PING ACK", session.session_id);
+    send_ping_ack(session, payload);
+}
+
+/**
+ * Handle GOAWAY frame (RFC 9113 §6.8)
+ */
+fn void handle_goaway(H2Session* session, char[] payload)
+{
+    if (payload.len < 8)
+    {
+        return;
+    }
+
+    uint last_stream = ((uint)(payload[0] & 0x7F) << 24) | ((uint)payload[1] << 16) |
+                       ((uint)payload[2] << 8) | (uint)payload[3];
+    uint error_code = ((uint)payload[4] << 24) | ((uint)payload[5] << 16) |
+                      ((uint)payload[6] << 8) | (uint)payload[7];
+
+    io::printfn("[%d] Received GOAWAY: last_stream=%d error=%d", session.session_id, last_stream, error_code);
+
+    session.state = ConnectionState.CLOSING;
+    session.release();
+}
+
+/**
+ * Handle WINDOW_UPDATE frame (RFC 9113 §6.9)
+ */
+fn void handle_window_update(H2Session* session, uint stream_id, char[] payload)
+{
+    if (payload.len != 4)
+    {
+        send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+        return;
+    }
+
+    uint increment = ((uint)(payload[0] & 0x7F) << 24) | ((uint)payload[1] << 16) |
+                     ((uint)payload[2] << 8) | (uint)payload[3];
+
+    if (increment == 0)
+    {
+        if (stream_id == 0)
+        {
+            send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        }
+        else
+        {
+            send_rst_stream(session, stream_id, ERR_PROTOCOL_ERROR);
+        }
+        return;
+    }
+
+    io::printfn("[%d] WINDOW_UPDATE: stream=%d increment=%d", session.session_id, stream_id, increment);
+
+    // Update flow control window
+    if (stream_id == 0)
+    {
+        session.connection_window += (int)increment;
+    }
+    // TODO: Track per-stream windows
+}
+
+/**
+ * Handle HEADERS frame (RFC 9113 §6.2)
+ */
+fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] payload)
+{
+    if (stream_id == 0)
+    {
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    io::printfn("[%d] HEADERS on stream %d (len=%d)", session.session_id, stream_id, payload.len);
+
+    // Track stream ID
+    if (stream_id > session.last_stream_id)
+    {
+        session.last_stream_id = stream_id;
+    }
+
+    // TODO: HPACK decode headers
+    // For now, just send a simple 200 OK response
+
+    bool end_stream = (flags & FLAG_END_STREAM) != 0;
+
+    if (end_stream)
+    {
+        // Client finished sending, respond with 200 OK
+        send_simple_response(session, stream_id);
+    }
+}
+
+/**
+ * Handle DATA frame (RFC 9113 §6.1)
+ */
+fn void handle_data(H2Session* session, char flags, uint stream_id, char[] payload)
+{
+    if (stream_id == 0)
+    {
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    io::printfn("[%d] DATA on stream %d (len=%d)", session.session_id, stream_id, payload.len);
+
+    // Update connection window
+    if (payload.len > 0)
+    {
+        // Send WINDOW_UPDATE to replenish connection window
+        send_window_update(session, 0, (uint)payload.len);
+        send_window_update(session, stream_id, (uint)payload.len);
+    }
+
+    bool end_stream = (flags & FLAG_END_STREAM) != 0;
+    if (end_stream)
+    {
+        send_simple_response(session, stream_id);
+    }
+}
+
+/**
+ * Handle RST_STREAM frame (RFC 9113 §6.4)
+ */
+fn void handle_rst_stream(H2Session* session, uint stream_id, char[] payload)
+{
+    if (stream_id == 0)
+    {
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    if (payload.len != 4)
+    {
+        send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+        return;
+    }
+
+    uint error_code = ((uint)payload[0] << 24) | ((uint)payload[1] << 16) |
+                      ((uint)payload[2] << 8) | (uint)payload[3];
+
+    io::printfn("[%d] RST_STREAM: stream=%d error=%d", session.session_id, stream_id, error_code);
+    // Stream is now closed - nothing more to do
+}
+
+// ============================================================================
+// Frame Sending Functions
+// ============================================================================
+
+/**
+ * Send our SETTINGS frame (server preface)
+ */
+fn void send_settings_frame(H2Session* session)
+{
+    // Settings payload: SETTINGS_MAX_CONCURRENT_STREAMS = 100
+    char[15] frame;
+
+    // Frame header
+    frame[0] = 0;  // Length high byte
+    frame[1] = 0;  // Length mid byte
+    frame[2] = 6;  // Length low byte (1 setting = 6 bytes)
+    frame[3] = FRAME_SETTINGS;
+    frame[4] = 0;  // No flags
+    frame[5] = 0;  // Stream ID = 0
+    frame[6] = 0;
+    frame[7] = 0;
+    frame[8] = 0;
+
+    // SETTINGS_MAX_CONCURRENT_STREAMS = 100
+    frame[9] = 0;
+    frame[10] = SETTINGS_MAX_CONCURRENT_STREAMS;
+    frame[11] = 0;
+    frame[12] = 0;
+    frame[13] = 0;
+    frame[14] = 100;
+
+    session.retain();
+    session.conn.write(frame[..], &on_write_complete, session)!!;
+    io::printfn("[%d] Sent SETTINGS frame", session.session_id);
+}
+
+/**
+ * Send SETTINGS ACK
+ */
+fn void send_settings_ack(H2Session* session)
+{
+    char[9] frame;
+
+    // Frame header (length = 0)
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = 0;
+    frame[3] = FRAME_SETTINGS;
+    frame[4] = FLAG_ACK;
+    frame[5] = 0;  // Stream ID = 0
+    frame[6] = 0;
+    frame[7] = 0;
+    frame[8] = 0;
+
+    session.retain();
+    session.conn.write(frame[..], &on_write_complete, session)!!;
+    session.settings_ack_sent = true;
+    io::printfn("[%d] Sent SETTINGS ACK", session.session_id);
+}
+
+/**
+ * Send PING ACK
+ */
+fn void send_ping_ack(H2Session* session, char[] opaque_data)
+{
+    char[17] frame;
+
+    // Frame header
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = 8;  // Length = 8
+    frame[3] = FRAME_PING;
+    frame[4] = FLAG_ACK;
+    frame[5] = 0;  // Stream ID = 0
+    frame[6] = 0;
+    frame[7] = 0;
+    frame[8] = 0;
+
+    // Copy opaque data
+    for (int i = 0; i < 8; i++)
+    {
+        frame[9 + i] = opaque_data[i];
+    }
+
+    session.retain();
+    session.conn.write(frame[..], &on_write_complete, session)!!;
+}
+
+/**
+ * Send GOAWAY frame
+ */
+fn void send_goaway(H2Session* session, uint last_stream_id, uint error_code)
+{
+    char[17] frame;
+
+    // Frame header
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = 8;  // Length = 8
+    frame[3] = FRAME_GOAWAY;
+    frame[4] = 0;  // No flags
+    frame[5] = 0;  // Stream ID = 0
+    frame[6] = 0;
+    frame[7] = 0;
+    frame[8] = 0;
+
+    // Last-Stream-ID (31 bits)
+    frame[9] = (char)((last_stream_id >> 24) & 0x7F);
+    frame[10] = (char)((last_stream_id >> 16) & 0xFF);
+    frame[11] = (char)((last_stream_id >> 8) & 0xFF);
+    frame[12] = (char)(last_stream_id & 0xFF);
+
+    // Error code
+    frame[13] = (char)((error_code >> 24) & 0xFF);
+    frame[14] = (char)((error_code >> 16) & 0xFF);
+    frame[15] = (char)((error_code >> 8) & 0xFF);
+    frame[16] = (char)(error_code & 0xFF);
+
+    session.state = ConnectionState.CLOSING;
+    session.retain();
+    session.conn.write(frame[..], &on_goaway_write_complete, session)!!;
+    io::printfn("[%d] Sent GOAWAY: last_stream=%d error=%d", session.session_id, last_stream_id, error_code);
+}
+
+/**
+ * Send RST_STREAM frame
+ */
+fn void send_rst_stream(H2Session* session, uint stream_id, uint error_code)
+{
+    char[13] frame;
+
+    // Frame header
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = 4;  // Length = 4
+    frame[3] = FRAME_RST_STREAM;
+    frame[4] = 0;  // No flags
+    // Stream ID
+    frame[5] = (char)((stream_id >> 24) & 0x7F);
+    frame[6] = (char)((stream_id >> 16) & 0xFF);
+    frame[7] = (char)((stream_id >> 8) & 0xFF);
+    frame[8] = (char)(stream_id & 0xFF);
+
+    // Error code
+    frame[9] = (char)((error_code >> 24) & 0xFF);
+    frame[10] = (char)((error_code >> 16) & 0xFF);
+    frame[11] = (char)((error_code >> 8) & 0xFF);
+    frame[12] = (char)(error_code & 0xFF);
+
+    session.retain();
+    session.conn.write(frame[..], &on_write_complete, session)!!;
+    io::printfn("[%d] Sent RST_STREAM: stream=%d error=%d", session.session_id, stream_id, error_code);
+}
+
+/**
+ * Send WINDOW_UPDATE frame
+ */
+fn void send_window_update(H2Session* session, uint stream_id, uint increment)
+{
+    char[13] frame;
+
+    // Frame header
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = 4;  // Length = 4
+    frame[3] = FRAME_WINDOW_UPDATE;
+    frame[4] = 0;  // No flags
+    // Stream ID
+    frame[5] = (char)((stream_id >> 24) & 0x7F);
+    frame[6] = (char)((stream_id >> 16) & 0xFF);
+    frame[7] = (char)((stream_id >> 8) & 0xFF);
+    frame[8] = (char)(stream_id & 0xFF);
+
+    // Window increment (31 bits)
+    frame[9] = (char)((increment >> 24) & 0x7F);
+    frame[10] = (char)((increment >> 16) & 0xFF);
+    frame[11] = (char)((increment >> 8) & 0xFF);
+    frame[12] = (char)(increment & 0xFF);
+
+    session.retain();
+    session.conn.write(frame[..], &on_write_complete, session)!!;
+}
+
+/**
+ * Send a simple 200 OK response (minimal HPACK)
+ */
+fn void send_simple_response(H2Session* session, uint stream_id)
+{
+    // Minimal HPACK-encoded response:
+    // :status = 200 (indexed, index 8 in static table)
+    // This is the simplest valid response
+
+    // HEADERS frame with END_HEADERS and END_STREAM
+    char[10] frame;
+
+    // Frame header
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = 1;  // Length = 1 byte (just :status indexed)
+    frame[3] = FRAME_HEADERS;
+    frame[4] = FLAG_END_HEADERS | FLAG_END_STREAM;
+    // Stream ID
+    frame[5] = (char)((stream_id >> 24) & 0x7F);
+    frame[6] = (char)((stream_id >> 16) & 0xFF);
+    frame[7] = (char)((stream_id >> 8) & 0xFF);
+    frame[8] = (char)(stream_id & 0xFF);
+
+    // HPACK: indexed header field (:status: 200 = index 8)
+    // 0x88 = 1xxx xxxx = indexed (0x80) + index 8 (0x08)
+    frame[9] = 0x88;
+
+    session.retain();
+    session.conn.write(frame[..], &on_write_complete, session)!!;
+    io::printfn("[%d] Sent 200 OK response on stream %d", session.session_id, stream_id);
+}
+
+// ============================================================================
+// Callbacks
+// ============================================================================
+
+fn void on_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
+{
+    H2Session* session = (H2Session*)user_data;
+    defer session.release();
+
+    if (status < 0)
+    {
+        io::eprintfn("[%d] Write error", session.session_id);
+    }
+}
+
+fn void on_goaway_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
+{
+    H2Session* session = (H2Session*)user_data;
+    io::printfn("[%d] GOAWAY sent, closing connection", session.session_id);
+    session.state = ConnectionState.CLOSED;
+    session.release();  // Release write callback ref
+    session.release();  // Release main ref to trigger cleanup
+}

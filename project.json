@@ -31,6 +31,11 @@
       "type": "executable",
       "sources": ["test/autobahn/websocket_server.c3"],
       "link-args": ["-Lbuild", "-l:c3web.a"]
+    },
+    "h2spec_server": {
+      "type": "executable",
+      "sources": ["test/h2spec/h2_server.c3"],
+      "link-args": ["-Lbuild", "-l:c3web.a"]
     }
   },
   "link-libc": true,
