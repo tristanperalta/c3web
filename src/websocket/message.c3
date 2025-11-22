@@ -8,6 +8,7 @@ module c3web::websocket::message;
 
 import c3web::websocket::frame;
 import c3web::websocket::utf8;
+import std::collections::list;
 import std::io;
 
 /**
@@ -35,22 +36,11 @@ faultdef MESSAGE_TOO_LARGE, INVALID_UTF8, UNEXPECTED_CONTINUATION,
  * - Final frame: FIN=1, opcode=CONTINUATION
  * - Control frames can be interleaved
  */
-/**
- * Fragment entry for tracking payload chunks
- */
-struct Fragment
-{
-    char[] data;
-    ulong len;
-}
-
 struct MessageBuilder
 {
     bool in_progress;                 // Currently reassembling a fragmented message
     frame::Opcode message_opcode;     // Opcode of the first frame
-    Fragment[] fragments;             // Dynamic array of payload fragments
-    usz fragment_count;               // Number of fragments
-    ulong total_size;                 // Total size accumulated
+    List{char} payload_data;          // Accumulated payload data
     ulong max_message_size;           // Maximum allowed message size
     utf8::Utf8Validator utf8_validator; // For streaming UTF-8 validation
 }
@@ -62,9 +52,7 @@ fn void MessageBuilder.init(&self) @public
 {
     self.in_progress = false;
     self.message_opcode = frame::Opcode.CONTINUATION;
-    self.fragments = {};
-    self.fragment_count = 0;
-    self.total_size = 0;
+    self.payload_data.init(mem);
     self.max_message_size = 10 * 1024 * 1024; // 10 MB default
     self.utf8_validator.init();
 }
@@ -74,10 +62,7 @@ fn void MessageBuilder.init(&self) @public
  */
 fn void MessageBuilder.free(&self) @public
 {
-    if (self.fragments.len > 0)
-    {
-        mem::free(self.fragments.ptr);
-    }
+    self.payload_data.free();
 }
 
 /**
@@ -93,60 +78,21 @@ fn void MessageBuilder.set_max_message_size(&self, ulong max_size) @public
  */
 fn void MessageBuilder.reset(&self) @public
 {
-    // Free any copied fragment data
-    for (usz i = 0; i < self.fragment_count; i++)
-    {
-        if (self.fragments[i].data.len > 0)
-        {
-            mem::free(self.fragments[i].data.ptr);
-        }
-    }
-
     self.in_progress = false;
     self.message_opcode = frame::Opcode.CONTINUATION;
-    self.fragment_count = 0;
-    self.total_size = 0;
+    self.payload_data.clear();
     self.utf8_validator.reset();
 }
 
 /**
- * Add a fragment to the internal array
- * Makes a copy of the data since the original buffer may be reused
+ * Add payload data to the accumulated buffer
  */
-fn void MessageBuilder.add_fragment(&self, char[] data, ulong len) @private
+fn void MessageBuilder.add_payload(&self, char[] data) @private
 {
-    // Grow array if needed
-    if (self.fragment_count >= self.fragments.len)
+    foreach (byte : data)
     {
-        usz new_cap = self.fragments.len == 0 ? 4 : self.fragments.len * 2;
-        Fragment[] new_fragments = mem::new_array(Fragment, new_cap);
-
-        // Copy existing fragments
-        foreach (i, frag : self.fragments)
-        {
-            new_fragments[i] = frag;
-        }
-
-        // Free old array
-        if (self.fragments.len > 0)
-        {
-            mem::free(self.fragments.ptr);
-        }
-
-        self.fragments = new_fragments;
+        self.payload_data.push(byte);
     }
-
-    // Copy the payload data since the original buffer may be modified
-    char[] data_copy = mem::new_array(char, len);
-    foreach (i, byte : data)
-    {
-        data_copy[i] = byte;
-    }
-
-    // Add new fragment with copied data
-    self.fragments[self.fragment_count].data = data_copy;
-    self.fragments[self.fragment_count].len = len;
-    self.fragment_count++;
 }
 
 /**
@@ -188,18 +134,16 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
             }
         }
 
-        // Add payload fragment
+        // Add payload data
         if (f.payload_len > 0)
         {
-            self.total_size += f.payload_len;
-            if (self.total_size > self.max_message_size)
+            if (self.payload_data.len() + f.payload_len > self.max_message_size)
             {
                 self.reset();
                 return MESSAGE_TOO_LARGE?;
             }
 
-            // Add fragment to array
-            self.add_fragment(f.payload, f.payload_len);
+            self.add_payload(f.payload);
         }
 
         // If FIN=1, message is complete
@@ -239,18 +183,16 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
         }
     }
 
-    // Add fragment
+    // Add payload data
     if (f.payload_len > 0)
     {
-        self.total_size += f.payload_len;
-        if (self.total_size > self.max_message_size)
+        if (self.payload_data.len() + f.payload_len > self.max_message_size)
         {
             self.reset();
             return MESSAGE_TOO_LARGE?;
         }
 
-        // Add fragment to array
-        self.add_fragment(f.payload, f.payload_len);
+        self.add_payload(f.payload);
     }
 
     // Check if message is complete
@@ -275,39 +217,16 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
 /**
  * Get the complete message after reassembly
  *
+ * Note: Returns a view into the builder's internal buffer.
+ * The data is valid until the next reset() or free() call.
+ *
  * @return Complete message with reassembled payload
  */
 fn Message? MessageBuilder.get_message(&self) @public
 {
-    if (self.fragment_count == 0)
-    {
-        // Empty message (just headers)
-        Message msg;
-        msg.opcode = self.message_opcode;
-        msg.payload = {};
-        msg.payload_len = 0;
-        return msg;
-    }
-
-    // Allocate buffer for complete message
-    char[] complete_payload = mem::new_array(char, self.total_size);
-
-    // Copy all fragments into buffer
-    ulong offset = 0;
-    for (usz i = 0; i < self.fragment_count; i++)
-    {
-        Fragment frag = self.fragments[i];
-        foreach (j, byte : frag.data)
-        {
-            complete_payload[offset + j] = byte;
-        }
-        offset += frag.len;
-    }
-
     Message msg;
     msg.opcode = self.message_opcode;
-    msg.payload = complete_payload;
-    msg.payload_len = self.total_size;
-
+    msg.payload = self.payload_data.array_view();
+    msg.payload_len = self.payload_data.len();
     return msg;
 }

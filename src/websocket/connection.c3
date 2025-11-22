@@ -185,13 +185,24 @@ fn Message? WebSocketConnection.receive_message(&self, char[] frame_data) @publi
     // Get complete message
     message::Message msg = self.msg_builder.get_message()!;
 
+    // Copy payload before reset (get_message returns a view into builder's buffer)
+    char[] payload_copy;
+    if (msg.payload_len > 0)
+    {
+        payload_copy = mem::new_array(char, msg.payload_len);
+        foreach (i, byte : msg.payload)
+        {
+            payload_copy[i] = byte;
+        }
+    }
+
     // Reset builder for next message
     self.msg_builder.reset();
 
     // Convert to public Message type
     Message result;
     result.opcode = msg.opcode;
-    result.payload = msg.payload;
+    result.payload = payload_copy;
     result.payload_len = msg.payload_len;
 
     return result;

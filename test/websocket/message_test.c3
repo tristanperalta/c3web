@@ -53,9 +53,8 @@ fn void test_reassemble_text_message_three_fragments() @test
     bool complete3 = builder.add_frame(f3)!!;
     assert(complete3, "Message should be complete after final fragment");
 
-    // Get complete message
+    // Get complete message (view into builder's buffer)
     message::Message msg = builder.get_message()!!;
-    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
 
     assert(msg.opcode == frame::Opcode.TEXT, "Message opcode should be TEXT");
     assert(msg.payload_len == 11, "Total payload length should be 11");
@@ -93,7 +92,6 @@ fn void test_reassemble_binary_message_two_fragments() @test
     assert(complete, "Binary message should be complete");
 
     message::Message msg = builder.get_message()!!;
-    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
 
     assert(msg.opcode == frame::Opcode.BINARY, "Message opcode should be BINARY");
     assert(msg.payload_len == 5, "Total payload length should be 5");
@@ -144,7 +142,6 @@ fn void test_interleaved_control_frame() @test
     assert(complete, "Message should be complete");
 
     message::Message msg = builder.get_message()!!;
-    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
 
     assert((String)msg.payload == "Hello World", "Message should not include PING data");
 }
@@ -232,7 +229,6 @@ fn void test_single_frame_message() @test
     assert(complete, "Single-frame message should be complete immediately");
 
     message::Message msg = builder.get_message()!!;
-    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
 
     assert((String)msg.payload == "Complete", "Single-frame message should be intact");
 }
@@ -274,7 +270,6 @@ fn void test_utf8_validation_across_fragments() @test
     assert(complete, "UTF-8 fragmented message should complete successfully");
 
     message::Message msg = builder.get_message()!!;
-    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
 
     assert(msg.payload_len == 7, "Total length should be 7 bytes");
     // Note: UTF-8 validation happens during reassembly
@@ -360,7 +355,6 @@ fn void test_empty_fragments() @test
     assert(complete, "Message with empty fragment should complete");
 
     message::Message msg = builder.get_message()!!;
-    defer if (msg.payload_len > 0) mem::free(msg.payload.ptr);
 
     assert((String)msg.payload == "Hello World", "Empty fragment should not affect result");
 }
