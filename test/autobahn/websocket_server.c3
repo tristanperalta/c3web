@@ -11,6 +11,7 @@ import c3web::websocket::handshake;
 import c3web::websocket::frame;
 import c3web::websocket::control;
 import c3web::websocket::message;
+import c3web::websocket::compression;
 import c3web::http1::parser;
 import async::event_loop;
 import async::tcp;
@@ -30,7 +31,12 @@ struct WebSocketSession
     bool handshake_response_writing;
     int session_id;
     DString pipelined_buffer;  // Buffer for data received during handshake write
-    DString frame_buffer;      // Buffer for incomplete WebSocket frames (TCP fragmentation)
+    DString frame_buffer;  // Buffer for incomplete WebSocket frames (TCP fragmentation)
+    usz frame_buffer_offset;  // Read offset into frame_buffer (avoid O(n²) copies)
+    // Compression support (RFC 7692)
+    bool compression_enabled;
+    compression::PerMessageDeflate pmd;
+    compression::ExtensionParams compression_params;
 }
 
 /**
@@ -63,6 +69,10 @@ fn void WebSocketSession.dealloc(&self)
     self.http_parser.free();
     self.pipelined_buffer.free();
     self.frame_buffer.free();
+    if (self.compression_enabled)
+    {
+        self.pmd.free();
+    }
     self.conn.close();
     mem::free(self);
 }
@@ -123,6 +133,7 @@ fn void on_connection(tcp::TcpConnection* server, tcp::TcpConnection* client, vo
     // RefCounted starts at 0 (valid), freed at -1. We hold one reference for the read callback.
     session.pipelined_buffer = dstring::new(mem);
     session.frame_buffer = dstring::new(mem);
+    session.frame_buffer_offset = 0;
 
     io::printfn("[%d] New connection", session.session_id);
 
@@ -222,6 +233,32 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
 
     io::printfn("[%d] Received Sec-WebSocket-Key: %s (len=%d)", session.session_id, ws_key, ws_key.len);
 
+    // Check for compression extension (RFC 7692)
+    String? extensions_header = req.headers.get("sec-websocket-extensions");
+    if (try ext_header = extensions_header)
+    {
+        if (ext_header.contains("permessage-deflate"))
+        {
+            io::printfn("[%d] Client requested permessage-deflate compression", session.session_id);
+            // Parse extension parameters
+            if (try params = compression::parse_extension(ext_header))
+            {
+                session.compression_params = params;
+                // Initialize compression context
+                if (catch init_err = session.pmd.init(params))
+                {
+                    io::eprintfn("[%d] Failed to init compression: %s", session.session_id, init_err);
+                }
+                else
+                {
+                    session.compression_enabled = true;
+                    io::printfn("[%d] Compression enabled (server_max_window_bits=%d, client_max_window_bits=%d)",
+                                session.session_id, params.server_max_window_bits, params.client_max_window_bits);
+                }
+            }
+        }
+    }
+
     // Generate accept key
     String? accept_key = handshake::generate_websocket_accept(ws_key);
     if (catch err = accept_key)
@@ -243,6 +280,13 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
     response.append("Upgrade: websocket\r\n");
     response.append("Connection: Upgrade\r\n");
     response.appendf("Sec-WebSocket-Accept: %s\r\n", accept_key);
+    // Add compression extension to response if enabled
+    if (session.compression_enabled)
+    {
+        String ext_response = compression::generate_response_header(session.compression_params);
+        defer mem::free(ext_response.ptr);
+        response.appendf("Sec-WebSocket-Extensions: %s\r\n", ext_response);
+    }
     response.append("\r\n");
 
     // Send response (tcp.write() will copy this valid heap data)
@@ -266,15 +310,17 @@ fn void handle_handshake(WebSocketSession* session, char[] data)
 fn void handle_websocket_data(WebSocketSession* session, char[] data)
 {
     // Append incoming data to frame buffer
-    session.frame_buffer.append(data);
+    session.frame_buffer.append_chars((String)data);
 
     // Process frames from buffer until we can't parse anymore
-    while (session.frame_buffer.len() > 0)
+    while (session.frame_buffer.len() > session.frame_buffer_offset)
     {
-        char[] buffer_data = (char[])session.frame_buffer.str_view();
+        // Get view of unread data in buffer (from offset to end)
+        char[] buffer_data = ((char[])session.frame_buffer.str_view())[session.frame_buffer_offset..];
 
         // First try to parse the frame header to see if we have enough data
-        frame::Frame? header_result = frame::parse_header(buffer_data);
+        // Allow RSV1 if compression is enabled (RFC 7692)
+        frame::Frame? header_result = frame::parse_header(buffer_data, session.compression_enabled);
         if (catch header_err = header_result)
         {
             if (header_err == frame::INCOMPLETE_FRAME)
@@ -356,7 +402,8 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
         else
         {
             // Handle data frame - call receive_message ONCE
-            connection::Message? msg_result = session.ws_conn.receive_message(frame_data);
+            // Pass allow_rsv1=true if compression enabled
+            connection::Message? msg_result = session.ws_conn.receive_message(frame_data, session.compression_enabled);
 
             if (catch msg_err = msg_result)
             {
@@ -384,20 +431,80 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
             {
                 // Got complete message - echo it back
                 connection::Message msg = msg_result;
+                char[] payload_to_echo = msg.payload;
+                bool payload_needs_free = true;
+
+                // Decompress if the message was compressed (RSV1 set on first frame)
+                if (msg.compressed && session.compression_enabled)
+                {
+                    if (try decompressed = session.pmd.decompress_message(msg.payload))
+                    {
+                        // Free original compressed payload
+                        if (msg.payload_len > 0)
+                        {
+                            mem::free(msg.payload.ptr);
+                        }
+                        payload_to_echo = decompressed;
+                        // Decompressed payload needs to be freed later
+                    }
+                    else if (catch decomp_err = session.pmd.decompress_message(msg.payload))
+                    {
+                        io::eprintfn("[%d] Decompression failed: %s", session.session_id, decomp_err);
+                        if (msg.payload_len > 0)
+                        {
+                            mem::free(msg.payload.ptr);
+                        }
+                        send_close_and_release(session, control::CLOSE_PROTOCOL_ERROR, "Decompression error");
+                        return;
+                    }
+                }
+
                 char[]? echo_frame;
 
-                if (msg.opcode == frame::Opcode.TEXT)
+                // Compress echo response if compression is enabled
+                if (session.compression_enabled)
                 {
-                    echo_frame = session.ws_conn.send_text((String)msg.payload);
+                    // Compress the payload
+                    if (try compressed = session.pmd.compress_message(payload_to_echo))
+                    {
+                        // Create frame with RSV1=1 to indicate compression
+                        echo_frame = frame::create_frame_with_rsv(msg.opcode, compressed, true, false, true, false, false);
+                        mem::free(compressed.ptr);
+                    }
+                    else if (catch comp_err = session.pmd.compress_message(payload_to_echo))
+                    {
+                        io::eprintfn("[%d] Compression failed: %s, sending uncompressed", session.session_id, comp_err);
+                        // Fall back to uncompressed
+                        if (msg.opcode == frame::Opcode.TEXT)
+                        {
+                            echo_frame = session.ws_conn.send_text((String)payload_to_echo);
+                        }
+                        else
+                        {
+                            echo_frame = session.ws_conn.send_binary(payload_to_echo);
+                        }
+                    }
                 }
-                else if (msg.opcode == frame::Opcode.BINARY)
+                else
                 {
-                    echo_frame = session.ws_conn.send_binary(msg.payload);
+                    // No compression - send as-is
+                    if (msg.opcode == frame::Opcode.TEXT)
+                    {
+                        echo_frame = session.ws_conn.send_text((String)payload_to_echo);
+                    }
+                    else if (msg.opcode == frame::Opcode.BINARY)
+                    {
+                        echo_frame = session.ws_conn.send_binary(payload_to_echo);
+                    }
                 }
 
                 if (catch err = echo_frame)
                 {
                     io::eprintfn("[%d] Failed to create echo frame: %s", session.session_id, err);
+                    if (payload_needs_free && payload_to_echo.len > 0)
+                    {
+                        mem::free(payload_to_echo.ptr);
+                    }
                     session.release();
                     return;
                 }
@@ -409,30 +516,40 @@ fn void handle_websocket_data(WebSocketSession* session, char[] data)
                     io::eprintfn("[%d] Write failed: %s", session.session_id, err);
                     session.release();  // Release the ref we just took
                     session.release();  // Release main ref
+                    if (payload_needs_free && payload_to_echo.len > 0)
+                    {
+                        mem::free(payload_to_echo.ptr);
+                    }
                     return;
                 }
 
-                // Free message payload
-                if (msg.payload_len > 0)
+                // Free payload
+                if (payload_needs_free && payload_to_echo.len > 0)
                 {
-                    mem::free(msg.payload.ptr);
+                    mem::free(payload_to_echo.ptr);
                 }
             }
         }
 
-        // Remove processed frame from buffer
-        // Create new buffer with remaining data
-        usz remaining_len = buffer_data.len - total_frame_size;
-        if (remaining_len > 0)
+        // Consume processed frame by advancing offset (O(1) instead of O(n) copy)
+        session.frame_buffer_offset += total_frame_size;
+
+        // Compact buffer periodically when offset exceeds 1MB to prevent unbounded growth
+        if (session.frame_buffer_offset > 1024 * 1024)
         {
-            DString new_buffer = dstring::new(mem);
-            new_buffer.append(buffer_data[total_frame_size:remaining_len]);
-            session.frame_buffer.free();
-            session.frame_buffer = new_buffer;
-        }
-        else
-        {
-            session.frame_buffer.clear();
+            // Remove consumed bytes from front of buffer
+            usz remaining = session.frame_buffer.len() - session.frame_buffer_offset;
+            if (remaining > 0)
+            {
+                char[] remaining_data = ((char[])session.frame_buffer.str_view())[session.frame_buffer_offset..];
+                session.frame_buffer.clear();
+                session.frame_buffer.append_chars((String)remaining_data);
+            }
+            else
+            {
+                session.frame_buffer.clear();
+            }
+            session.frame_buffer_offset = 0;
         }
     }
 }

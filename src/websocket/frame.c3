@@ -189,15 +189,39 @@ fn Frame? parse_header(char[] data, bool allow_rsv1 = false) @public
  * Unmask payload data
  *
  * RFC 6455 §5.3: XOR each byte with mask_key[i % 4]
+ * Optimized: Process 8 bytes at a time using 64-bit XOR with unaligned access.
  *
  * @param payload - Masked payload data (modified in place)
  * @param mask_key - 4-byte masking key
  */
 fn void unmask_payload(char[] payload, char[4] mask_key) @public
 {
-    foreach (i, &byte : payload)
+    if (payload.len == 0) return;
+
+    // Create 32-bit mask from 4-byte key
+    uint mask32 = (uint)mask_key[0] | ((uint)mask_key[1] << 8) |
+                  ((uint)mask_key[2] << 16) | ((uint)mask_key[3] << 24);
+
+    // Create 64-bit mask by duplicating 32-bit mask
+    ulong mask64 = (ulong)mask32 | ((ulong)mask32 << 32);
+
+    usz i = 0;
+    usz len = payload.len;
+
+    // Process 8 bytes at a time using unaligned 64-bit operations
+    while (i + 8 <= len)
     {
-        *byte ^= mask_key[i % 4];
+        ulong* ptr = (ulong*)&payload[i];
+        ulong val = @unaligned_load(*ptr, 1);
+        @unaligned_store(*ptr, val ^ mask64, 1);
+        i += 8;
+    }
+
+    // Handle remaining bytes (0-7)
+    while (i < len)
+    {
+        payload[i] ^= mask_key[i & 3];
+        i++;
     }
 }
 

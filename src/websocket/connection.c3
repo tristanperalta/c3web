@@ -31,6 +31,7 @@ struct Message
     frame::Opcode opcode;
     char[] payload;
     ulong payload_len;
+    bool compressed;  // RSV1 was set (RFC 7692 compression)
 }
 
 /**
@@ -155,17 +156,18 @@ fn char[]? WebSocketConnection.send_close(&self, ushort status_code, String reas
  * Handles fragmentation automatically. Returns message only when complete.
  *
  * @param frame_data - Raw frame bytes
+ * @param allow_rsv1 - Allow RSV1 bit for compression (RFC 7692)
  * @return Complete message, or fault if incomplete/control frame
  */
-fn Message? WebSocketConnection.receive_message(&self, char[] frame_data) @public
+fn Message? WebSocketConnection.receive_message(&self, char[] frame_data, bool allow_rsv1 = false) @public
 {
     if (self.state == State.CLOSED)
     {
         return CONNECTION_CLOSED?;
     }
 
-    // Parse frame
-    frame::Frame f = frame::parse(frame_data)!;
+    // Parse frame (allow RSV1 if compression is enabled)
+    frame::Frame f = frame::parse(frame_data, allow_rsv1)!;
 
     // Control frames should be handled separately
     if (frame::is_control_frame(f.opcode))
@@ -190,10 +192,8 @@ fn Message? WebSocketConnection.receive_message(&self, char[] frame_data) @publi
     if (msg.payload_len > 0)
     {
         payload_copy = mem::new_array(char, msg.payload_len);
-        foreach (i, byte : msg.payload)
-        {
-            payload_copy[i] = byte;
-        }
+        // Use bulk copy instead of byte-by-byte (critical for 4MB+ messages)
+        mem::copy(payload_copy.ptr, msg.payload.ptr, msg.payload_len);
     }
 
     // Reset builder for next message
@@ -204,6 +204,7 @@ fn Message? WebSocketConnection.receive_message(&self, char[] frame_data) @publi
     result.opcode = msg.opcode;
     result.payload = payload_copy;
     result.payload_len = msg.payload_len;
+    result.compressed = msg.compressed;  // RSV1 from first frame (RFC 7692)
 
     return result;
 }
@@ -340,10 +341,10 @@ fn char[]? create_data_frame(frame::Opcode opcode, char[] payload, bool fin) @pr
         offset = 10;
     }
 
-    // Copy payload
-    foreach (i, byte : payload)
+    // Copy payload using bulk copy (critical for large messages)
+    if (payload.len > 0)
     {
-        frame_data[offset + i] = byte;
+        mem::copy(&frame_data[offset], payload.ptr, payload.len);
     }
 
     return frame_data;

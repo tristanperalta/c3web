@@ -19,6 +19,7 @@ struct Message
     frame::Opcode opcode;    // Original opcode (TEXT or BINARY)
     char[] payload;          // Complete message payload
     ulong payload_len;       // Total payload length
+    bool compressed;         // RSV1 was set on first frame (RFC 7692)
 }
 
 /**
@@ -43,6 +44,7 @@ struct MessageBuilder
     List{char} payload_data;          // Accumulated payload data
     ulong max_message_size;           // Maximum allowed message size
     utf8::Utf8Validator utf8_validator; // For streaming UTF-8 validation
+    bool message_compressed;          // RSV1 was set on first frame (RFC 7692)
 }
 
 /**
@@ -52,9 +54,11 @@ fn void MessageBuilder.init(&self) @public
 {
     self.in_progress = false;
     self.message_opcode = frame::Opcode.CONTINUATION;
-    self.payload_data.init(mem);
+    // Pre-allocate 64KB to avoid repeated reallocations for large messages
+    self.payload_data.init(mem, 64 * 1024);
     self.max_message_size = 10 * 1024 * 1024; // 10 MB default
     self.utf8_validator.init();
+    self.message_compressed = false;
 }
 
 /**
@@ -82,6 +86,7 @@ fn void MessageBuilder.reset(&self) @public
     self.message_opcode = frame::Opcode.CONTINUATION;
     self.payload_data.clear();
     self.utf8_validator.reset();
+    self.message_compressed = false;
 }
 
 /**
@@ -89,10 +94,8 @@ fn void MessageBuilder.reset(&self) @public
  */
 fn void MessageBuilder.add_payload(&self, char[] data) @private
 {
-    foreach (byte : data)
-    {
-        self.payload_data.push(byte);
-    }
+    // Use bulk copy instead of byte-by-byte (critical for 4MB+ messages)
+    self.payload_data.push_all(data);
 }
 
 /**
@@ -123,6 +126,8 @@ fn bool? MessageBuilder.add_frame(&self, frame::Frame f) @public
         self.message_opcode = f.opcode;
         self.in_progress = true;
         self.utf8_validator.reset();
+        // Track RSV1 from first frame (RFC 7692 compression indicator)
+        self.message_compressed = f.rsv1;
 
         // Validate UTF-8 for text frames
         if (f.opcode == frame::Opcode.TEXT && f.payload_len > 0)
@@ -228,5 +233,6 @@ fn Message? MessageBuilder.get_message(&self) @public
     msg.opcode = self.message_opcode;
     msg.payload = self.payload_data.array_view();
     msg.payload_len = self.payload_data.len();
+    msg.compressed = self.message_compressed;
     return msg;
 }
