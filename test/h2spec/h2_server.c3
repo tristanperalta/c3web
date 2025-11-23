@@ -19,6 +19,9 @@ import async::tcp;
 import std::io;
 import std::atomic;
 import std::thread;
+import c3web::http2::stream;
+import c3web::http2::frame;
+import std::collections::map;
 
 const ushort SERVER_PORT = 8080;
 
@@ -111,6 +114,19 @@ struct H2Session
     bool settings_ack_sent;
     bool settings_ack_received;
     uint last_stream_id;  // Last stream ID processed (for GOAWAY)
+
+    // Stream management
+    HashMap{uint, stream::Stream} streams;  // Map stream_id -> Stream state machine
+    uint active_stream_count;               // Track concurrent streams
+    uint highest_client_stream_id;          // Track highest seen client stream ID (for monotonic check)
+
+    // CONTINUATION state tracking
+    bool expecting_continuation;            // True if HEADERS/PUSH_PROMISE had END_HEADERS=0
+    uint continuation_stream_id;            // Stream ID expecting CONTINUATION
+    DString header_block_buffer;            // Accumulates header fragments
+
+    // Frame validation settings
+    frame::ConnectionSettings frame_settings;  // For frame::validate_frame()
 }
 
 fn void H2Session.retain(&self)
@@ -131,6 +147,8 @@ fn void H2Session.dealloc(&self)
 {
     io::printfn("[%d] Session cleanup", self.session_id);
     self.recv_buffer.free();
+    self.header_block_buffer.free();  // Cleanup CONTINUATION buffer
+    self.streams.free();                // Cleanup stream map
     self.conn.close();
     mem::free(self);
 }
@@ -152,6 +170,102 @@ fn void H2Session.init(&self)
     self.settings_ack_sent = false;
     self.settings_ack_received = false;
     self.last_stream_id = 0;
+
+    // Initialize stream tracking
+    self.streams.init(mem, 100);  // Capacity of 100 streams
+    self.active_stream_count = 0;
+    self.highest_client_stream_id = 0;
+
+    // Initialize CONTINUATION state
+    self.expecting_continuation = false;
+    self.continuation_stream_id = 0;
+    self.header_block_buffer = dstring::new(mem);
+
+    // Initialize frame validation settings
+    self.frame_settings = frame::default_settings();
+}
+
+/**
+ * Stream Management Functions
+ */
+
+/**
+ * Validate stream ID rules (RFC 9113 §5.1.1)
+ * Returns CONNECTION_ERROR for violations
+ */
+fn void? validate_stream_creation(H2Session* session, uint stream_id, char frame_type)
+{
+    // Only validate for frames that create streams (HEADERS, PRIORITY)
+    if (frame_type != FRAME_HEADERS && frame_type != FRAME_PRIORITY)
+    {
+        return;  // Other frames don't create streams
+    }
+
+    // Client streams must be odd
+    if (!stream::is_valid_client_stream_id(stream_id))
+    {
+        io::eprintfn("[%d] Invalid stream ID %d (must be odd)", session.session_id, stream_id);
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return stream::CONNECTION_ERROR?;
+    }
+
+    // Stream ID must be greater than previous (monotonically increasing)
+    if (stream_id <= session.highest_client_stream_id)
+    {
+        io::eprintfn("[%d] Stream ID %d not increasing (last was %d)",
+                     session.session_id, stream_id, session.highest_client_stream_id);
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return stream::CONNECTION_ERROR?;
+    }
+
+    // Check concurrent stream limit
+    if (session.active_stream_count >= session.local_max_concurrent_streams)
+    {
+        io::eprintfn("[%d] Max concurrent streams exceeded", session.session_id);
+        send_rst_stream(session, stream_id, ERR_REFUSED_STREAM);
+        return stream::STREAM_ERROR?;
+    }
+}
+
+/**
+ * Get existing stream or create new one
+ */
+fn stream::Stream* get_or_create_stream(H2Session* session, uint stream_id)
+{
+    // Check if stream exists and return reference
+    if (try stream_ref = session.streams.get_ref(stream_id))
+    {
+        return stream_ref;
+    }
+
+    // Create new stream
+    stream::Stream new_stream = stream::new_stream(stream_id, session.local_initial_window_size);
+    session.streams.set(stream_id, new_stream);
+
+    // Update tracking
+    if (stream_id > session.highest_client_stream_id)
+    {
+        session.highest_client_stream_id = stream_id;
+    }
+    session.active_stream_count++;
+
+    // Return reference to newly inserted stream
+    return session.streams.get_ref(stream_id)!!;
+}
+
+/**
+ * Close and remove stream
+ */
+fn void close_stream(H2Session* session, uint stream_id)
+{
+    if (try s = session.streams.get_ref(stream_id))
+    {
+        if (s.state != stream::StreamState.CLOSED)
+        {
+            session.active_stream_count--;
+        }
+        session.streams.remove(stream_id);
+    }
 }
 
 int global_session_id = 0;
@@ -325,6 +439,74 @@ fn void process_frames(H2Session* session)
         io::printfn("[%d] Frame: type=%d flags=0x%02x stream=%d len=%d",
                     session.session_id, frame_type, flags, stream_id, length);
 
+        // Frame validation
+        frame::FrameHeader header = (frame::FrameHeader){
+            .length = length,
+            .type = (stream::FrameType)frame_type,
+            .flags = flags,
+            .stream_id = stream_id
+        };
+
+        // Validate frame structure
+        if (catch err = frame::validate_frame(&header, payload, &session.frame_settings))
+        {
+            io::eprintfn("[%d] Frame validation error: %s", session.session_id, @typeid(err).nameof);
+            send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+            return;
+        }
+
+        // Stream-specific validation for stream-level frames
+        if (stream_id > 0)
+        {
+            // Validate stream creation (ID ordering, concurrency)
+            if (catch err = validate_stream_creation(session, stream_id, frame_type))
+            {
+                // Error already sent in validate_stream_creation
+                return;
+            }
+
+            // Get or create stream
+            stream::Stream* stream_state = get_or_create_stream(session, stream_id);
+
+            // Validate frame is allowed in current stream state
+            if (catch err = stream::validate_frame_for_state(stream_state, (stream::FrameType)frame_type))
+            {
+                if (err == stream::CONNECTION_ERROR)
+                {
+                    // IDLE state violations -> CONNECTION_ERROR
+                    uint error_code = (uint)stream::get_error_code_for_violation(stream_state, (stream::FrameType)frame_type);
+                    io::eprintfn("[%d] Stream %d: CONNECTION_ERROR for frame type %d in state %s",
+                                 session.session_id, stream_id, frame_type, stream::get_state_name(stream_state.state));
+                    send_goaway(session, session.last_stream_id, error_code);
+                    return;
+                }
+                else
+                {
+                    // STREAM_ERROR -> send RST_STREAM, skip processing, remove frame
+                    uint error_code = (uint)stream::get_error_code_for_violation(stream_state, (stream::FrameType)frame_type);
+                    io::eprintfn("[%d] Stream %d: STREAM_ERROR for frame type %d in state %s",
+                                 session.session_id, stream_id, frame_type, stream::get_state_name(stream_state.state));
+                    send_rst_stream(session, stream_id, error_code);
+
+                    // Skip processing this frame, just remove it from buffer
+                    if (buffer.len > total_frame_len)
+                    {
+                        usz remaining_len = buffer.len - total_frame_len;
+                        char* remaining_data = mem::malloc(remaining_len);
+                        mem::copy(remaining_data, &buffer[total_frame_len], remaining_len);
+                        session.recv_buffer.clear();
+                        session.recv_buffer.append((String)remaining_data[:remaining_len]);
+                        mem::free(remaining_data);
+                    }
+                    else
+                    {
+                        session.recv_buffer.clear();
+                    }
+                    continue;  // Continue to next frame
+                }
+            }
+        }
+
         // Handle frame by type
         switch (frame_type)
         {
@@ -356,10 +538,15 @@ fn void process_frames(H2Session* session)
         // Remove processed frame from buffer
         if (buffer.len > total_frame_len)
         {
-            DString new_buffer = dstring::new(mem);
-            new_buffer.append(buffer[total_frame_len..]);
-            session.recv_buffer.free();
-            session.recv_buffer = new_buffer;
+            // Create new buffer with remaining data
+            usz remaining_len = buffer.len - total_frame_len;
+            char* remaining_data = mem::malloc(remaining_len);
+            mem::copy(remaining_data, &buffer[total_frame_len], remaining_len);
+
+            // Replace buffer
+            session.recv_buffer.clear();
+            session.recv_buffer.append((String)remaining_data[:remaining_len]);
+            mem::free(remaining_data);
         }
         else
         {

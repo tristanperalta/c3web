@@ -106,12 +106,18 @@ fi
 echo -e "${YELLOW}Running h2spec conformance tests...${NC}"
 echo ""
 
-$H2SPEC_CMD -p $H2SPEC_PORT $H2SPEC_EXTRA_ARGS
+H2SPEC_LOG="$PROJECT_ROOT/reports/h2spec_$(date +%Y%m%d_%H%M%S).log"
+mkdir -p "$PROJECT_ROOT/reports"
 
-RESULT=$?
+$H2SPEC_CMD -p $H2SPEC_PORT $H2SPEC_EXTRA_ARGS 2>&1 | tee "$H2SPEC_LOG"
+
+RESULT=${PIPESTATUS[0]}
 
 echo ""
 echo -e "${GREEN}=== h2spec Testsuite Complete ===${NC}"
+echo ""
+echo "Results saved to: $H2SPEC_LOG"
+echo "Server log: /tmp/h2spec_server.log"
 echo ""
 echo "To run specific sections:"
 echo "  $0 -S 3           # Section 3: Starting HTTP/2"
