@@ -155,9 +155,13 @@ fn void? validate_frame_for_state(Stream* stream, FrameType frame_type) {
 
         case CLOSED:
             // Only PRIORITY allowed (brief grace period)
-            // Other frames are STREAM_ERROR (STREAM_CLOSED)
             if (frame_type == PRIORITY) {
                 return;
+            }
+            // HEADERS on closed stream is CONNECTION_ERROR per RFC 9113 §5.1
+            // Other frames are STREAM_ERROR (STREAM_CLOSED)
+            if (frame_type == HEADERS) {
+                return CONNECTION_ERROR?;
             }
             return STREAM_ERROR?;
     }
