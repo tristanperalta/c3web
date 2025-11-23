@@ -21,6 +21,7 @@ import std::atomic;
 import std::thread;
 import c3web::http2::stream;
 import c3web::http2::frame;
+import c3web::http2::hpack;
 import std::collections::map;
 
 const ushort SERVER_PORT = 8080;
@@ -267,6 +268,106 @@ fn void close_stream(H2Session* session, uint stream_id)
         }
         session.streams.remove(stream_id);
     }
+}
+
+/**
+ * Validate HTTP/2 headers (RFC 9113 §8.1.2)
+ * Returns error code if validation fails, 0 if valid
+ */
+fn uint validate_http2_headers(hpack::HeaderField[] headers)
+{
+    bool seen_regular_header = false;
+    bool has_method = false;
+    bool has_scheme = false;
+    bool has_path = false;
+
+    foreach (i, header : headers)
+    {
+        String name = header.name;
+        String value = header.value;
+
+        // RFC 9113 §8.2: Header field names MUST be lowercase
+        foreach (c : name)
+        {
+            if (c >= 'A' && c <= 'Z')
+            {
+                return ERR_PROTOCOL_ERROR;  // Uppercase in header name
+            }
+        }
+
+        // Check if this is a pseudo-header
+        if (name.len > 0 && name[0] == ':')
+        {
+            // Pseudo-headers MUST appear before regular headers (RFC 9113 §8.1.2.1)
+            if (seen_regular_header)
+            {
+                return ERR_PROTOCOL_ERROR;
+            }
+
+            // Validate known pseudo-headers for requests
+            if (name == ":method")
+            {
+                if (has_method)  return ERR_PROTOCOL_ERROR;  // Duplicate
+                has_method = true;
+            }
+            else if (name == ":scheme")
+            {
+                if (has_scheme)  return ERR_PROTOCOL_ERROR;  // Duplicate
+                has_scheme = true;
+            }
+            else if (name == ":path")
+            {
+                if (has_path)  return ERR_PROTOCOL_ERROR;  // Duplicate
+                has_path = true;
+                // :path MUST NOT be empty (RFC 9113 §8.1.2.3)
+                if (value.len == 0)
+                {
+                    return ERR_PROTOCOL_ERROR;
+                }
+            }
+            else if (name == ":authority")
+            {
+                // :authority is optional
+            }
+            else if (name == ":status")
+            {
+                // :status is for responses, not requests
+                return ERR_PROTOCOL_ERROR;
+            }
+            else
+            {
+                // Unknown pseudo-header
+                return ERR_PROTOCOL_ERROR;
+            }
+        }
+        else
+        {
+            // Regular header
+            seen_regular_header = true;
+
+            // Check for connection-specific headers (RFC 9113 §8.1.2.2)
+            if (name == "connection" || name == "keep-alive" ||
+                name == "proxy-connection" || name == "transfer-encoding" ||
+                name == "upgrade")
+            {
+                return ERR_PROTOCOL_ERROR;
+            }
+
+            // TE header only allowed with value "trailers"
+            if (name == "te" && value != "trailers")
+            {
+                return ERR_PROTOCOL_ERROR;
+            }
+        }
+    }
+
+    // All requests MUST include :method, :scheme, and :path (RFC 9113 §8.1.2.3)
+    if (!has_method || !has_scheme || !has_path)
+    {
+        return ERR_PROTOCOL_ERROR;
+    }
+
+    return 0;  // Valid
 }
 
 int global_session_id = 0;
@@ -848,8 +949,28 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
     io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
                 stream::get_state_name(stream_state.state));
 
-    // TODO: HPACK decode headers
-    // For now, just send a simple 200 OK response
+    // HPACK decode headers
+    hpack::HeaderField[]? decoded_headers = hpack::decode_header_block(payload);
+    if (catch err = decoded_headers)
+    {
+        io::eprintfn("[%d] Stream %d: HPACK decoding failed: %s",
+                     session.session_id, stream_id, @typeid(err).nameof);
+        send_goaway(session, session.last_stream_id, ERR_COMPRESSION_ERROR);
+        return;
+    }
+
+    hpack::HeaderField[] headers = decoded_headers;
+
+    // Validate HTTP/2 headers (RFC 9113 §8.1.2)
+    uint validation_error = validate_http2_headers(headers);
+    if (validation_error != 0)
+    {
+        io::eprintfn("[%d] Stream %d: Header validation failed", session.session_id, stream_id);
+        send_rst_stream(session, stream_id, validation_error);
+        return;
+    }
+
+    io::printfn("[%d] Stream %d: Decoded %d headers", session.session_id, stream_id, headers.len);
 
     if (end_stream)
     {
@@ -893,11 +1014,38 @@ fn void handle_continuation(H2Session* session, char flags, uint stream_id, char
         io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
                     stream::get_state_name(stream_state.state));
 
+        // HPACK decode complete header block
+        char[] header_block = (char[])session.header_block_buffer.str_view();
+        hpack::HeaderField[]? decoded_headers = hpack::decode_header_block(header_block);
+        if (catch err = decoded_headers)
+        {
+            io::eprintfn("[%d] Stream %d: HPACK decoding failed: %s",
+                         session.session_id, stream_id, @typeid(err).nameof);
+            send_goaway(session, session.last_stream_id, ERR_COMPRESSION_ERROR);
+            session.expecting_continuation = false;
+            session.header_block_buffer.clear();
+            return;
+        }
+
+        hpack::HeaderField[] headers = decoded_headers;
+
+        // Validate HTTP/2 headers (RFC 9113 §8.1.2)
+        uint validation_error = validate_http2_headers(headers);
+        if (validation_error != 0)
+        {
+            io::eprintfn("[%d] Stream %d: Header validation failed", session.session_id, stream_id);
+            send_rst_stream(session, stream_id, validation_error);
+            session.expecting_continuation = false;
+            session.header_block_buffer.clear();
+            return;
+        }
+
+        io::printfn("[%d] Stream %d: Decoded %d headers from CONTINUATION", session.session_id, stream_id, headers.len);
+
         // Clear CONTINUATION state
         session.expecting_continuation = false;
 
-        // TODO: HPACK decode complete header block from session.header_block_buffer
-        // For now, just send a simple 200 OK response
+        // Send response if request complete
         if (end_stream)
         {
             send_simple_response(session, stream_id);

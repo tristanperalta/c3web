@@ -301,11 +301,11 @@ fn String? decode_huffman(char[] data) {
     char[4096] output;
     usz output_len = 0;
 
-    uint bits = 0;      // Accumulated bits
+    ulong bits = 0;     // Accumulated bits (64-bit to prevent overflow)
     uint num_bits = 0;  // Number of accumulated bits
 
     foreach (b : data) {
-        bits = (bits << 8) | (uint)(char)b;
+        bits = (bits << 8) | (ulong)(char)b;
         num_bits += 8;
 
         while (num_bits >= 5) {  // Minimum Huffman code length
@@ -330,7 +330,7 @@ fn String? decode_huffman(char[] data) {
         return INVALID_HUFFMAN?;  // Too much padding
     }
     if (num_bits > 0) {
-        uint padding_mask = (1u << num_bits) - 1;
+        ulong padding_mask = (1ul << num_bits) - 1;
         if ((bits & padding_mask) != padding_mask) {
             return INVALID_HUFFMAN?;  // Padding not all 1s
         }
@@ -340,11 +340,11 @@ fn String? decode_huffman(char[] data) {
 }
 
 // Huffman symbol decoder - returns symbol (0-255), -1 for need more bits, -2 for EOS
-fn int decode_huffman_symbol(uint* bits, uint* num_bits) {
+fn int decode_huffman_symbol(ulong* bits, uint* num_bits) {
     if (*num_bits < 5) return -1;
 
     // 5-bit codes (most common)
-    uint code5 = (*bits >> (*num_bits - 5)) & 0x1F;
+    uint code5 = (uint)((*bits >> (*num_bits - 5)) & 0x1F);
     int sym5 = lookup_huffman_5bit(code5);
     if (sym5 >= 0) {
         *num_bits -= 5;
@@ -352,7 +352,7 @@ fn int decode_huffman_symbol(uint* bits, uint* num_bits) {
     }
 
     if (*num_bits < 6) return -1;
-    uint code6 = (*bits >> (*num_bits - 6)) & 0x3F;
+    uint code6 = (uint)((*bits >> (*num_bits - 6)) & 0x3F);
     int sym6 = lookup_huffman_6bit(code6);
     if (sym6 >= 0) {
         *num_bits -= 6;
@@ -360,7 +360,7 @@ fn int decode_huffman_symbol(uint* bits, uint* num_bits) {
     }
 
     if (*num_bits < 7) return -1;
-    uint code7 = (*bits >> (*num_bits - 7)) & 0x7F;
+    uint code7 = (uint)((*bits >> (*num_bits - 7)) & 0x7F);
     int sym7 = lookup_huffman_7bit(code7);
     if (sym7 >= 0) {
         *num_bits -= 7;
@@ -368,7 +368,7 @@ fn int decode_huffman_symbol(uint* bits, uint* num_bits) {
     }
 
     if (*num_bits < 8) return -1;
-    uint code8 = (*bits >> (*num_bits - 8)) & 0xFF;
+    uint code8 = (uint)((*bits >> (*num_bits - 8)) & 0xFF);
     int sym8 = lookup_huffman_8bit(code8);
     if (sym8 >= 0) {
         *num_bits -= 8;
@@ -377,7 +377,7 @@ fn int decode_huffman_symbol(uint* bits, uint* num_bits) {
 
     // Check for EOS (30 bits of 1s)
     if (*num_bits >= 30) {
-        uint eos_mask = 0x3FFFFFFF;
+        ulong eos_mask = 0x3FFFFFFF;
         if (((*bits >> (*num_bits - 30)) & eos_mask) == eos_mask) {
             return -2;  // EOS found - error
         }
