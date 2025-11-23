@@ -79,6 +79,8 @@ struct Stream {
     usz bytes_received;       // Bytes received (for Content-Length validation)
     usz expected_bytes;       // Expected bytes from Content-Length header
     bool has_content_length;  // Whether Content-Length was specified
+    bool pending_response;    // True if we have response data blocked on flow control
+    bool headers_sent;        // True if we've sent HEADERS for response
 }
 
 /**
@@ -93,6 +95,8 @@ fn Stream new_stream(uint stream_id, uint initial_window_size = 65535) {
         .bytes_received = 0,
         .expected_bytes = 0,
         .has_content_length = false,
+        .pending_response = false,
+        .headers_sent = false,
     };
 }
 

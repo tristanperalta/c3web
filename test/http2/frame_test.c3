@@ -442,8 +442,8 @@ fn void test_setting_enable_push_invalid() @test
  */
 fn void test_setting_initial_window_size_exceeds_max() @test
 {
-    // INITIAL_WINDOW_SIZE must not exceed 2^31-1
-    assert(@catch(frame::validate_setting_value(0x4, 0x80000000)) == frame::PROTOCOL_ERROR);
+    // INITIAL_WINDOW_SIZE must not exceed 2^31-1 (RFC 9113 §6.5.2: FLOW_CONTROL_ERROR)
+    assert(@catch(frame::validate_setting_value(0x4, 0x80000000)) == frame::FLOW_CONTROL_ERROR);
 
     io::printn("[OK] INITIAL_WINDOW_SIZE exceeds max fails");
 }

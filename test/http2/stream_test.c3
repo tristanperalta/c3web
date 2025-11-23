@@ -408,7 +408,8 @@ fn void test_frame_validation_closed() @test
 
     // Other frames not allowed
     assert(@catch(stream::validate_frame_for_state(&s, stream::FrameType.DATA)) == stream::STREAM_ERROR);
-    assert(@catch(stream::validate_frame_for_state(&s, stream::FrameType.HEADERS)) == stream::STREAM_ERROR);
+    // HEADERS on closed stream is CONNECTION_ERROR per RFC 9113 §5.1
+    assert(@catch(stream::validate_frame_for_state(&s, stream::FrameType.HEADERS)) == stream::CONNECTION_ERROR);
     assert(@catch(stream::validate_frame_for_state(&s, stream::FrameType.WINDOW_UPDATE)) == stream::STREAM_ERROR);
 
     io::printn("[OK] Frame validation for CLOSED state");

@@ -24,8 +24,14 @@ import c3web::http2::frame;
 import c3web::http2::hpack;
 import std::collections::map;
 import std::core::mem::allocator;
+import libc;
 
 const ushort SERVER_PORT = 8080;
+
+// Signal handling for SIGPIPE (POSIX)
+// SIG_IGN is typically (void*)1 - ignore signal
+extern fn void* signal(CInt signum, void* handler) @extern("signal");
+const void* SIG_IGN_PTR = (void*)(uptr)1;
 
 // HTTP/2 Connection Preface (RFC 9113 §3.4)
 // Client must send this first, followed by a SETTINGS frame
@@ -139,14 +145,24 @@ struct H2Session
 fn void H2Session.retain(&self)
 {
     int old = self.refcount.load(RELAXED);
-    assert(old >= 0, "Retaining zombie session (refcount < 0)");
+    if (old < 0)
+    {
+        io::eprintfn("[%d] FATAL: Retaining zombie session (refcount=%d)", self.session_id, old);
+        io::stderr().flush()!!;
+        unreachable("Retaining zombie session");
+    }
     self.refcount.add(1, RELAXED);
 }
 
 fn void H2Session.release(&self)
 {
     int old = self.refcount.load(RELAXED);
-    assert(old >= 0, "Over-release of session (refcount < 0)");
+    if (old < 0)
+    {
+        io::eprintfn("[%d] FATAL: Over-release of session (refcount=%d)", self.session_id, old);
+        io::stderr().flush()!!;
+        unreachable("Over-release of session");
+    }
 
     // Refcount semantics: 0 = 1 reference, dealloc when dropping to -1
     // Use RELEASE ordering so other threads see our writes before dealloc
@@ -279,7 +295,10 @@ fn stream::Stream* get_or_create_stream(H2Session* session, uint stream_id)
     }
 
     // Create new stream
+    // recv_window = our local window (how much we can receive)
+    // send_window = remote's window (how much we can send to them)
     stream::Stream new_stream = stream::new_stream(stream_id, session.local_initial_window_size);
+    new_stream.send_window = session.remote_initial_window_size;  // Use remote's window for sending
     session.streams.set(stream_id, new_stream);
 
     // Update tracking
@@ -460,6 +479,10 @@ int global_session_id = 0;
 
 fn int main()
 {
+    // Ignore SIGPIPE - prevents crash when writing to closed sockets
+    // This is essential for network servers handling multiple connections
+    (void)signal(libc::SIGPIPE, SIG_IGN_PTR);
+
     io::printn("Starting HTTP/2 Test Server for h2spec...");
     io::printfn("Listening on http://0.0.0.0:%d", SERVER_PORT);
 
@@ -600,6 +623,12 @@ fn void process_frames(H2Session* session)
 {
     while (true)
     {
+        // Early exit if connection is closed (e.g., write error occurred)
+        if (session.state == ConnectionState.CLOSED)
+        {
+            return;
+        }
+
         char[] buffer = (char[])session.recv_buffer.str_view();
 
         // Need at least 9 bytes for frame header
@@ -866,7 +895,33 @@ fn void handle_settings(H2Session* session, char flags, uint stream_id, char[] p
                     send_goaway(session, session.last_stream_id, ERR_FLOW_CONTROL_ERROR);
                     return;
                 }
+                // RFC 9113 §6.5.2: Adjust all existing stream windows by the delta
+                int delta = (int)value - (int)session.remote_initial_window_size;
+                if (delta != 0 && session.streams.count > 0)
+                {
+                    // Iterate over all streams and adjust send windows
+                    foreach (entry : session.streams.table)
+                    {
+                        while (entry)
+                        {
+                            stream::Stream* s = &entry.value;
+                            // Calculate new window, checking for overflow
+                            long new_window = (long)s.send_window + (long)delta;
+                            if (new_window > 2147483647)
+                            {
+                                // Flow control error - window exceeds max
+                                send_goaway(session, session.last_stream_id, ERR_FLOW_CONTROL_ERROR);
+                                return;
+                            }
+                            s.send_window = (uint)new_window;
+                            io::printfn("[%d] Stream %d window adjusted by %d to %d",
+                                        session.session_id, s.id, delta, s.send_window);
+                            entry = entry.next;
+                        }
+                    }
+                }
                 session.remote_initial_window_size = value;
+                io::printfn("[%d] Initial window size now: %d", session.session_id, value);
                 break;
             case SETTINGS_MAX_FRAME_SIZE:
                 if (value < DEFAULT_MAX_FRAME_SIZE || value > MAX_FRAME_SIZE_LIMIT)
@@ -954,6 +1009,61 @@ fn void handle_goaway(H2Session* session, char[] payload)
 }
 
 /**
+ * Send pending DATA when flow control window opens
+ */
+fn void send_pending_data(H2Session* session, uint stream_id, stream::Stream* stream_state)
+{
+    // Fixed response body: "OK\n"
+    char[3] body = { 'O', 'K', '\n' };
+    uint body_len = 3;
+
+    // Calculate how much we can send
+    uint bytes_to_send = body_len;
+    if (stream_state.send_window < bytes_to_send) { bytes_to_send = stream_state.send_window; }
+    if (session.connection_window > 0 && (uint)session.connection_window < bytes_to_send) {
+        bytes_to_send = (uint)session.connection_window;
+    }
+    if (session.connection_window <= 0) { bytes_to_send = 0; }
+
+    if (bytes_to_send == 0) return;  // Still blocked
+
+    io::printfn("[%d] Sending pending DATA: stream=%d, bytes=%d", session.session_id, stream_id, bytes_to_send);
+
+    // Build DATA frame - arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 12);  // 9 header + 3 body max
+    frame[0] = 0;
+    frame[1] = 0;
+    frame[2] = (char)bytes_to_send;  // Length
+    frame[3] = FRAME_DATA;
+    frame[4] = (bytes_to_send == body_len) ? FLAG_END_STREAM : 0;  // END_STREAM if complete
+    frame[5] = (char)((stream_id >> 24) & 0x7F);
+    frame[6] = (char)((stream_id >> 16) & 0xFF);
+    frame[7] = (char)((stream_id >> 8) & 0xFF);
+    frame[8] = (char)(stream_id & 0xFF);
+
+    for (uint i = 0; i < bytes_to_send; i++)
+    {
+        frame[9 + i] = body[i];
+    }
+
+    // Update flow control windows
+    stream_state.send_window -= bytes_to_send;
+    session.connection_window -= (int)bytes_to_send;
+
+    // Update stream state
+    if (bytes_to_send == body_len)
+    {
+        stream_state.pending_response = false;
+        (void)stream::send_end_stream(stream_state);
+        io::printfn("[%d] Stream %d completed with pending DATA", session.session_id, stream_id);
+    }
+
+    usz total_len = (usz)(9 + bytes_to_send);
+    session.retain();
+    session.conn.write(frame[0:total_len], &on_write_complete, session)!!;
+}
+
+/**
  * Handle WINDOW_UPDATE frame (RFC 9113 §6.9)
  */
 fn void handle_window_update(H2Session* session, uint stream_id, char[] payload)
@@ -1015,6 +1125,12 @@ fn void handle_window_update(H2Session* session, uint stream_id, char[] payload)
 
         io::printfn("[%d] Stream %d send_window: %d", session.session_id, stream_id,
                     stream_state.send_window);
+
+        // Check if this stream has pending response data
+        if (stream_state.pending_response && stream_state.send_window > 0)
+        {
+            send_pending_data(session, stream_id, stream_state);
+        }
     }
 }
 
@@ -1321,7 +1437,7 @@ fn void handle_data(H2Session* session, char flags, uint stream_id, char[] paylo
         io::printfn("[%d] DATA padding: %d bytes, data: %d bytes", session.session_id, pad_length, data_length);
 
         // Extract data without pad_length byte and padding
-        data = payload[1 .. 1 + data_length];
+        data = payload[1:data_length];
     }
 
     // Get stream state
@@ -1345,15 +1461,22 @@ fn void handle_data(H2Session* session, char flags, uint stream_id, char[] paylo
     // Update flow control windows
     if (payload.len > 0)
     {
+        io::printfn("[%d] Sending conn WINDOW_UPDATE for %d bytes", session.session_id, payload.len);
         // Always send connection-level WINDOW_UPDATE
         send_window_update(session, 0, (uint)payload.len);
-        // Only send stream-level WINDOW_UPDATE if stream is not closed
-        if (stream_state.state != stream::StreamState.CLOSED)
+        io::printfn("[%d] Sent conn WINDOW_UPDATE", session.session_id);
+        // Only send stream-level WINDOW_UPDATE if stream is still open for receiving
+        // Skip if HALF_CLOSED_REMOTE/CLOSED - no more data expected from client
+        if (stream_state.state != stream::StreamState.CLOSED &&
+            stream_state.state != stream::StreamState.HALF_CLOSED_REMOTE)
         {
+            io::printfn("[%d] Sending stream WINDOW_UPDATE for stream %d", session.session_id, stream_id);
             send_window_update(session, stream_id, (uint)payload.len);
+            io::printfn("[%d] Sent stream WINDOW_UPDATE", session.session_id);
         }
     }
 
+    io::printfn("[%d] handle_data complete", session.session_id);
     // Response was already sent when headers were received (for h2spec testing)
     // A real server would respond here after processing the request body
 }
@@ -1403,7 +1526,8 @@ fn void handle_rst_stream(H2Session* session, uint stream_id, char[] payload)
 fn void send_settings_frame(H2Session* session)
 {
     // Settings payload: SETTINGS_MAX_CONCURRENT_STREAMS = 100
-    char[15] frame;
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 15);
 
     // Frame header
     frame[0] = 0;  // Length high byte
@@ -1434,7 +1558,8 @@ fn void send_settings_frame(H2Session* session)
  */
 fn void send_settings_ack(H2Session* session)
 {
-    char[9] frame;
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 9);
 
     // Frame header (length = 0)
     frame[0] = 0;
@@ -1458,7 +1583,8 @@ fn void send_settings_ack(H2Session* session)
  */
 fn void send_ping_ack(H2Session* session, char[] opaque_data)
 {
-    char[17] frame;
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 17);
 
     // Frame header
     frame[0] = 0;
@@ -1491,7 +1617,8 @@ fn void send_goaway(H2Session* session, uint last_stream_id, uint error_code)
         return;
     }
 
-    char[17] frame;
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 17);
 
     // Frame header
     frame[0] = 0;
@@ -1527,7 +1654,8 @@ fn void send_goaway(H2Session* session, uint last_stream_id, uint error_code)
  */
 fn void send_rst_stream(H2Session* session, uint stream_id, uint error_code)
 {
-    char[13] frame;
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 13);
 
     // Frame header
     frame[0] = 0;
@@ -1557,7 +1685,8 @@ fn void send_rst_stream(H2Session* session, uint stream_id, uint error_code)
  */
 fn void send_window_update(H2Session* session, uint stream_id, uint increment)
 {
-    char[13] frame;
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 13);
 
     // Frame header
     frame[0] = 0;
@@ -1578,66 +1707,126 @@ fn void send_window_update(H2Session* session, uint stream_id, uint increment)
     frame[12] = (char)(increment & 0xFF);
 
     session.retain();
-    session.conn.write(frame[..], &on_write_complete, session)!!;
+    session.conn.write(frame, &on_write_complete, session)!!;
 }
 
 /**
  * Send a simple 200 OK response (minimal HPACK)
+ * Respects flow control windows per RFC 9113 §5.2
  */
 fn void send_simple_response(H2Session* session, uint stream_id)
 {
-    // Send response with body for h2spec half-closed tests:
-    // - HEADERS with END_HEADERS (no END_STREAM)
-    // - DATA with END_STREAM
-    // This allows testing WINDOW_UPDATE/PRIORITY on half-closed(remote) streams
+    // Get stream for flow control check
+    stream::Stream* stream_state;
+    if (try s = session.streams.get_ref(stream_id))
+    {
+        stream_state = s;
+    }
+    else
+    {
+        io::eprintfn("[%d] Cannot send response: stream %d not found", session.session_id, stream_id);
+        return;
+    }
 
-    // Combined HEADERS + DATA in one buffer to send atomically
-    char[22] frame;
+    // Response body
+    char[3] body = { 'O', 'K', '\n' };
+    uint body_len = 3;
+
+    // Calculate how much we can send based on flow control windows
+    // Both stream window and connection window must allow data
+    uint stream_window = stream_state.send_window;
+    int conn_window = session.connection_window;
+
+    // Determine bytes to send (minimum of body, stream window, connection window)
+    uint bytes_to_send = body_len;
+    if (stream_window < bytes_to_send) bytes_to_send = stream_window;
+    if (conn_window > 0 && (uint)conn_window < bytes_to_send) bytes_to_send = (uint)conn_window;
+    if (conn_window <= 0) bytes_to_send = 0;
+
+    io::printfn("[%d] Flow control: stream_window=%d, conn_window=%d, sending=%d bytes",
+                session.session_id, stream_window, conn_window, bytes_to_send);
+
+    // If we can't send any data due to flow control, send HEADERS only (no END_STREAM)
+    // and wait for WINDOW_UPDATE to send the DATA
+    if (bytes_to_send == 0)
+    {
+        // Send HEADERS only WITHOUT END_STREAM - data will follow when window opens
+        char[10] headers_frame;
+        headers_frame[0] = 0; headers_frame[1] = 0; headers_frame[2] = 1;  // Length = 1
+        headers_frame[3] = FRAME_HEADERS;
+        headers_frame[4] = FLAG_END_HEADERS;  // NO END_STREAM - body pending
+        headers_frame[5] = (char)((stream_id >> 24) & 0x7F);
+        headers_frame[6] = (char)((stream_id >> 16) & 0xFF);
+        headers_frame[7] = (char)((stream_id >> 8) & 0xFF);
+        headers_frame[8] = (char)(stream_id & 0xFF);
+        headers_frame[9] = 0x88;  // :status: 200
+
+        // Mark stream as having pending response data
+        // Stream stays in HALF_CLOSED_LOCAL (we sent HEADERS, client sent END_STREAM)
+        stream_state.pending_response = true;
+        stream_state.headers_sent = true;
+        // Don't transition state - keep it open for DATA later
+
+        session.retain();
+        session.conn.write(headers_frame[..], &on_write_complete, session)!!;
+        io::printfn("[%d] Sent 200 HEADERS (body pending, window=0) on stream %d", session.session_id, stream_id);
+        return;
+    }
+
+    // Send HEADERS + partial/full DATA respecting flow control
+    bool is_complete = (bytes_to_send == body_len);
+
+    // Buffer: 9 (HEADERS header) + 1 (payload) + 9 (DATA header) + bytes_to_send
+    // Arena allocated (freed when session ends)
+    char[] frame = allocator::alloc_array(&session.arena, char, 22);  // Max: 10 + 12 = 22 bytes
 
     // === HEADERS frame (10 bytes) ===
-    // Frame header
-    frame[0] = 0;
-    frame[1] = 0;
-    frame[2] = 1;  // Length = 1 byte (just :status indexed)
+    frame[0] = 0; frame[1] = 0; frame[2] = 1;  // Length = 1 byte
     frame[3] = FRAME_HEADERS;
     frame[4] = FLAG_END_HEADERS;  // NOT END_STREAM - body follows
-    // Stream ID
     frame[5] = (char)((stream_id >> 24) & 0x7F);
     frame[6] = (char)((stream_id >> 16) & 0xFF);
     frame[7] = (char)((stream_id >> 8) & 0xFF);
     frame[8] = (char)(stream_id & 0xFF);
-    // HPACK: indexed header field (:status: 200 = index 8)
-    frame[9] = 0x88;
+    frame[9] = 0x88;  // :status: 200
 
-    // === DATA frame (12 bytes) ===
-    // Frame header
+    // === DATA frame (9 + bytes_to_send bytes) ===
     frame[10] = 0;
     frame[11] = 0;
-    frame[12] = 3;  // Length = 3 bytes ("OK\n")
+    frame[12] = (char)bytes_to_send;  // Length
     frame[13] = FRAME_DATA;
-    frame[14] = FLAG_END_STREAM;  // End of response
-    // Stream ID
+    frame[14] = is_complete ? FLAG_END_STREAM : 0;  // END_STREAM only if complete
     frame[15] = (char)((stream_id >> 24) & 0x7F);
     frame[16] = (char)((stream_id >> 16) & 0xFF);
     frame[17] = (char)((stream_id >> 8) & 0xFF);
     frame[18] = (char)(stream_id & 0xFF);
-    // Body: "OK\n"
-    frame[19] = 'O';
-    frame[20] = 'K';
-    frame[21] = '\n';
 
-    // Update stream state - we're sending END_STREAM
-    if (try stream_state = session.streams.get_ref(stream_id))
+    // Copy body data
+    for (uint i = 0; i < bytes_to_send; i++)
     {
-        // Transition: OPEN -> HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE -> CLOSED
+        frame[19 + i] = body[i];
+    }
+
+    // Update flow control windows
+    stream_state.send_window -= bytes_to_send;
+    session.connection_window -= (int)bytes_to_send;
+
+    // Update stream state if we sent END_STREAM
+    if (is_complete)
+    {
         (void)stream::send_end_stream(stream_state);
         io::printfn("[%d] Stream %d state after response: %s", session.session_id, stream_id,
                     stream::get_state_name(stream_state.state));
     }
 
+    // Calculate actual frame size to send (use length syntax [0:len] for slice)
+    usz total_len = (usz)(10 + 9 + bytes_to_send);  // HEADERS(10) + DATA header(9) + body
+
     session.retain();
-    session.conn.write(frame[..], &on_write_complete, session)!!;
-    io::printfn("[%d] Sent 200 OK response with body on stream %d", session.session_id, stream_id);
+    session.conn.write(frame[0:total_len], &on_write_complete, session)!!;
+    io::printfn("[%d] Sent 200 OK with %d/%d bytes on stream %d%s",
+                session.session_id, bytes_to_send, body_len, stream_id,
+                is_complete ? " (complete)" : " (partial)");
 }
 
 // ============================================================================
@@ -1646,12 +1835,25 @@ fn void send_simple_response(H2Session* session, uint stream_id)
 
 fn void on_write_complete(tcp::TcpConnection* conn, int status, void* user_data)
 {
+    // Debug: log entry
+    io::printfn("on_write_complete: status=%d user_data=%p", status, user_data);
+    io::stdout().flush()!!;
+
     H2Session* session = (H2Session*)user_data;
+    io::printfn("[%d] on_write_complete: status=%d refcount=%d",
+                session.session_id, status, session.refcount.load(RELAXED));
+    io::stdout().flush()!!;
+
     defer session.release();
 
     if (status < 0)
     {
-        io::eprintfn("[%d] Write error", session.session_id);
+        io::eprintfn("[%d] Write error: %d", session.session_id, status);
+        // Mark connection as closed to stop frame processing
+        // Don't call stop_read() here - it could trigger EOF callback synchronously,
+        // which would release the session before our defer runs, causing use-after-free.
+        // The natural EOF from the client closing will handle cleanup.
+        session.state = ConnectionState.CLOSED;
     }
 }
 
