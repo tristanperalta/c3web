@@ -30,12 +30,14 @@
     "autobahn_server": {
       "type": "executable",
       "sources": ["test/autobahn/websocket_server.c3"],
-      "link-args": ["-Lbuild", "-l:c3web.a"]
+      "link-args": ["-Lbuild", "-l:c3web.a"],
+      "sanitize": "address"
     },
     "h2spec_server": {
       "type": "executable",
       "sources": ["test/h2spec/h2_server.c3"],
-      "link-args": ["-Lbuild", "-l:c3web.a"]
+      "link-args": ["-Lbuild", "-l:c3web.a"],
+      "sanitize": "address"
     }
   },
   "link-libc": true,

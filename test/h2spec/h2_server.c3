@@ -23,6 +23,7 @@ import c3web::http2::stream;
 import c3web::http2::frame;
 import c3web::http2::hpack;
 import std::collections::map;
+import std::core::mem::allocator;
 
 const ushort SERVER_PORT = 8080;
 
@@ -97,6 +98,10 @@ struct H2Session
     ConnectionState state;
     int session_id;
 
+    // Per-session arena allocator - all session allocations use this
+    // When session ends, just free the arena - no memory leaks possible
+    DynamicArenaAllocator arena;
+
     // Receive buffer for handling TCP fragmentation
     DString recv_buffer;
     usz preface_bytes_received;
@@ -138,6 +143,8 @@ fn void H2Session.retain(&self)
 
 fn void H2Session.release(&self)
 {
+    // Note: refcount starts at 0, sub(1) returns old value (0), so check == 0
+    // This means first release() triggers dealloc (session lifetime = single use)
     if (self.refcount.sub(1, RELAXED) == 0)
     {
         thread::fence(ACQUIRE);
@@ -148,9 +155,17 @@ fn void H2Session.release(&self)
 fn void H2Session.dealloc(&self)
 {
     io::printfn("[%d] Session cleanup", self.session_id);
-    self.recv_buffer.free();
-    self.header_block_buffer.free();  // Cleanup CONTINUATION buffer
-    self.streams.free();                // Cleanup stream map
+
+    // Free HashMap first (uses heap allocator)
+    self.streams.free();
+
+    // Free header_block_buffer (uses heap allocator for resizing)
+    self.header_block_buffer.free();
+
+    // Free the arena - this releases ALL arena allocations at once
+    // (recv_buffer and any other arena allocations)
+    self.arena.free();
+
     self.conn.close();
     mem::free(self);
 }
@@ -158,7 +173,12 @@ fn void H2Session.dealloc(&self)
 fn void H2Session.init(&self)
 {
     self.state = ConnectionState.AWAITING_PREFACE;
-    self.recv_buffer = dstring::new(mem);
+
+    // Initialize per-session arena allocator (32KB pages, grows as needed)
+    self.arena.init(mem, 32 * 1024);
+
+    // Use arena for DStrings - no manual free needed, arena handles it
+    self.recv_buffer.init(&self.arena);
     self.preface_bytes_received = 0;
 
     // Initialize with default settings
@@ -173,7 +193,7 @@ fn void H2Session.init(&self)
     self.settings_ack_received = false;
     self.last_stream_id = 0;
 
-    // Initialize stream tracking
+    // Initialize stream tracking (HashMap uses heap, not arena - it needs to resize)
     self.streams.init(mem, 100);  // Capacity of 100 streams
     self.active_stream_count = 0;
     self.highest_client_stream_id = 0;
@@ -181,7 +201,9 @@ fn void H2Session.init(&self)
     // Initialize CONTINUATION state
     self.expecting_continuation = false;
     self.continuation_stream_id = 0;
-    self.header_block_buffer = dstring::new(mem);
+    // Use heap allocator for header_block_buffer since it needs to grow dynamically
+    // Arena allocators don't support reallocation properly
+    self.header_block_buffer.init(mem);
 
     // Initialize frame validation settings
     self.frame_settings = frame::default_settings();
@@ -194,11 +216,15 @@ fn void H2Session.init(&self)
 /**
  * Validate stream ID rules (RFC 9113 §5.1.1)
  * Returns CONNECTION_ERROR for violations
+ *
+ * Note: PRIORITY frames do NOT create streams (RFC 9113 §5.1) and can be sent
+ * for any stream ID. Only HEADERS frames create streams.
  */
 fn void? validate_stream_creation(H2Session* session, uint stream_id, char frame_type)
 {
-    // Only validate for frames that create streams (HEADERS, PRIORITY)
-    if (frame_type != FRAME_HEADERS && frame_type != FRAME_PRIORITY)
+    // Only validate for frames that create streams (HEADERS only)
+    // PRIORITY frames do NOT open streams - they only affect prioritization
+    if (frame_type != FRAME_HEADERS)
     {
         return;  // Other frames don't create streams
     }
@@ -483,11 +509,18 @@ fn void process_preface(H2Session* session)
 
     io::printfn("[%d] Valid connection preface received", session.session_id);
 
-    // Remove preface from buffer
-    session.recv_buffer = dstring::new(mem);
+    // Remove preface from buffer - copy remaining to temp first (can't append from self)
     if (buffer.len > CONNECTION_PREFACE.len)
     {
-        session.recv_buffer.append(buffer[CONNECTION_PREFACE.len..]);
+        usz remaining_len = buffer.len - CONNECTION_PREFACE.len;
+        char* temp = allocator::alloc_array(&session.arena, char, remaining_len);
+        mem::copy(temp, &buffer[CONNECTION_PREFACE.len], remaining_len);
+        session.recv_buffer.clear();
+        session.recv_buffer.append((String)temp[:remaining_len]);
+    }
+    else
+    {
+        session.recv_buffer.clear();
     }
 
     // Move to next state - awaiting client's SETTINGS frame
@@ -557,8 +590,41 @@ fn void process_frames(H2Session* session)
             return;
         }
 
+        // CONTINUATION validation (RFC 9113 §6.10)
+        // Must be checked BEFORE stream state validation since stream stays IDLE until END_HEADERS
+        if (session.expecting_continuation)
+        {
+            if (frame_type != FRAME_CONTINUATION)
+            {
+                io::eprintfn("[%d] Expected CONTINUATION but got frame type %d",
+                             session.session_id, frame_type);
+                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+
+            if (stream_id != session.continuation_stream_id)
+            {
+                io::eprintfn("[%d] CONTINUATION stream ID mismatch: expected %d, got %d",
+                             session.session_id, session.continuation_stream_id, stream_id);
+                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+        }
+        else
+        {
+            // Not expecting CONTINUATION, so CONTINUATION frame is a protocol error
+            if (frame_type == FRAME_CONTINUATION)
+            {
+                io::eprintfn("[%d] Unexpected CONTINUATION frame", session.session_id);
+                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+        }
+
         // Stream-specific validation for stream-level frames
-        if (stream_id > 0)
+        // Note: PRIORITY frames do NOT create streams and don't need stream state validation
+        // Note: CONTINUATION frames skip this - stream stays IDLE until END_HEADERS
+        if (stream_id > 0 && frame_type != FRAME_PRIORITY && frame_type != FRAME_CONTINUATION)
         {
             // Validate stream creation (ID ordering, concurrency)
             if (catch err = validate_stream_creation(session, stream_id, frame_type))
@@ -593,12 +659,12 @@ fn void process_frames(H2Session* session)
                     // Skip processing this frame, just remove it from buffer
                     if (buffer.len > total_frame_len)
                     {
+                        // Copy remaining data to temp buffer first (can't append from self - overlapping memory)
                         usz remaining_len = buffer.len - total_frame_len;
-                        char* remaining_data = mem::malloc(remaining_len);
-                        mem::copy(remaining_data, &buffer[total_frame_len], remaining_len);
+                        char* temp = allocator::alloc_array(&session.arena, char, remaining_len);
+                        mem::copy(temp, &buffer[total_frame_len], remaining_len);
                         session.recv_buffer.clear();
-                        session.recv_buffer.append((String)remaining_data[:remaining_len]);
-                        mem::free(remaining_data);
+                        session.recv_buffer.append((String)temp[:remaining_len]);
                     }
                     else
                     {
@@ -606,37 +672,6 @@ fn void process_frames(H2Session* session)
                     }
                     continue;  // Continue to next frame
                 }
-            }
-        }
-
-        // CONTINUATION validation (RFC 9113 §6.10)
-        // If expecting CONTINUATION, next frame MUST be CONTINUATION on same stream
-        if (session.expecting_continuation)
-        {
-            if (frame_type != FRAME_CONTINUATION)
-            {
-                io::eprintfn("[%d] Expected CONTINUATION but got frame type %d",
-                             session.session_id, frame_type);
-                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
-                return;
-            }
-
-            if (stream_id != session.continuation_stream_id)
-            {
-                io::eprintfn("[%d] CONTINUATION stream ID mismatch: expected %d, got %d",
-                             session.session_id, session.continuation_stream_id, stream_id);
-                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
-                return;
-            }
-        }
-        else
-        {
-            // Not expecting CONTINUATION, so CONTINUATION frame is a protocol error
-            if (frame_type == FRAME_CONTINUATION)
-            {
-                io::eprintfn("[%d] Unexpected CONTINUATION frame", session.session_id);
-                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
-                return;
             }
         }
 
@@ -670,23 +705,22 @@ fn void process_frames(H2Session* session)
         // Remove processed frame from buffer
         if (buffer.len > total_frame_len)
         {
-            // Create new buffer with remaining data
+            // Copy remaining data to temp buffer first (can't append from self - overlapping memory)
             usz remaining_len = buffer.len - total_frame_len;
-            char* remaining_data = mem::malloc(remaining_len);
-            mem::copy(remaining_data, &buffer[total_frame_len], remaining_len);
-
-            // Replace buffer
+            char* temp = allocator::alloc_array(&session.arena, char, remaining_len);
+            mem::copy(temp, &buffer[total_frame_len], remaining_len);
             session.recv_buffer.clear();
-            session.recv_buffer.append((String)remaining_data[:remaining_len]);
-            mem::free(remaining_data);
+            session.recv_buffer.append((String)temp[:remaining_len]);
+            // Note: temp is allocated from arena, freed when session ends
         }
         else
         {
             session.recv_buffer.clear();
         }
 
-        // Check if connection is closing
-        if (session.state == ConnectionState.CLOSING || session.state == ConnectionState.CLOSED)
+        // Check if connection is fully closed
+        // Note: CLOSING state still allows processing frames (for graceful shutdown)
+        if (session.state == ConnectionState.CLOSED)
         {
             return;
         }
@@ -839,8 +873,11 @@ fn void handle_goaway(H2Session* session, char[] payload)
 
     io::printfn("[%d] Received GOAWAY: last_stream=%d error=%d", session.session_id, last_stream, error_code);
 
+    // RFC 9113 §6.8: Unknown error codes are treated as INTERNAL_ERROR
+    // but we should continue processing frames until connection closes
+    // Don't immediately release - allow remaining frames to be processed
     session.state = ConnectionState.CLOSING;
-    session.release();
+    // Note: Session will be released when peer closes connection
 }
 
 /**
@@ -876,18 +913,30 @@ fn void handle_window_update(H2Session* session, uint stream_id, char[] payload)
     if (stream_id == 0)
     {
         // Connection-level WINDOW_UPDATE
-        session.connection_window += (int)increment;
+        // Check for flow control window overflow (RFC 9113 §6.9.1)
+        // Window cannot exceed 2^31-1 (0x7FFFFFFF)
+        long new_window = (long)session.connection_window + (long)increment;
+        if (new_window > 0x7FFFFFFF)
+        {
+            io::eprintfn("[%d] Connection flow control window overflow: %d + %d > 2^31-1",
+                         session.session_id, session.connection_window, increment);
+            send_goaway(session, session.last_stream_id, ERR_FLOW_CONTROL_ERROR);
+            return;
+        }
+        session.connection_window = (int)new_window;
     }
     else
     {
         // Stream-level WINDOW_UPDATE
         stream::Stream* stream_state = get_or_create_stream(session, stream_id);
 
-        // Transition stream state machine
+        // Transition stream state machine (includes overflow check)
         if (catch err = stream::on_window_update_received(stream_state, increment))
         {
             io::eprintfn("[%d] Stream %d: Error processing WINDOW_UPDATE: %s",
                          session.session_id, stream_id, @typeid(err).nameof);
+            // Send RST_STREAM for flow control error
+            send_rst_stream(session, stream_id, ERR_FLOW_CONTROL_ERROR);
             return;
         }
 
@@ -944,6 +993,19 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
             send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
             return;
         }
+
+        // Extract stream dependency (RFC 9113 §5.3.1: stream cannot depend on itself)
+        uint stream_dependency = ((uint)(payload[offset] & 0x7F) << 24) |
+                                 ((uint)payload[offset + 1] << 16) |
+                                 ((uint)payload[offset + 2] << 8) |
+                                 (uint)payload[offset + 3];
+        if (stream_dependency == stream_id)
+        {
+            io::eprintfn("[%d] Stream %d depends on itself", session.session_id, stream_id);
+            send_rst_stream(session, stream_id, ERR_PROTOCOL_ERROR);
+            return;
+        }
+
         offset += 5;
     }
 
@@ -1121,11 +1183,13 @@ fn void handle_data(H2Session* session, char flags, uint stream_id, char[] paylo
 
     bool end_stream = (flags & FLAG_END_STREAM) != 0;
 
-    // Transition stream state machine
+    // Transition stream state machine (includes Content-Length validation)
     if (catch err = stream::on_data_received(stream_state, (uint)payload.len, end_stream))
     {
         io::eprintfn("[%d] Stream %d: Error processing DATA: %s",
                      session.session_id, stream_id, @typeid(err).nameof);
+        // Send RST_STREAM for Content-Length mismatch or state errors
+        send_rst_stream(session, stream_id, ERR_PROTOCOL_ERROR);
         return;
     }
 
@@ -1417,6 +1481,7 @@ fn void on_goaway_write_complete(tcp::TcpConnection* conn, int status, void* use
     H2Session* session = (H2Session*)user_data;
     io::printfn("[%d] GOAWAY sent, closing connection", session.session_id);
     session.state = ConnectionState.CLOSED;
-    session.release();  // Release write callback ref
-    session.release();  // Release main ref to trigger cleanup
+    // Only release the write callback's reference
+    // Session cleanup happens when read EOF is received (in on_read)
+    session.release();
 }
