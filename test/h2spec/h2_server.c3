@@ -123,6 +123,7 @@ struct H2Session
     // CONTINUATION state tracking
     bool expecting_continuation;            // True if HEADERS/PUSH_PROMISE had END_HEADERS=0
     uint continuation_stream_id;            // Stream ID expecting CONTINUATION
+    bool continuation_end_stream;           // END_STREAM flag from original HEADERS
     DString header_block_buffer;            // Accumulates header fragments
 
     // Frame validation settings
@@ -507,6 +508,37 @@ fn void process_frames(H2Session* session)
             }
         }
 
+        // CONTINUATION validation (RFC 9113 §6.10)
+        // If expecting CONTINUATION, next frame MUST be CONTINUATION on same stream
+        if (session.expecting_continuation)
+        {
+            if (frame_type != FRAME_CONTINUATION)
+            {
+                io::eprintfn("[%d] Expected CONTINUATION but got frame type %d",
+                             session.session_id, frame_type);
+                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+
+            if (stream_id != session.continuation_stream_id)
+            {
+                io::eprintfn("[%d] CONTINUATION stream ID mismatch: expected %d, got %d",
+                             session.session_id, session.continuation_stream_id, stream_id);
+                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+        }
+        else
+        {
+            // Not expecting CONTINUATION, so CONTINUATION frame is a protocol error
+            if (frame_type == FRAME_CONTINUATION)
+            {
+                io::eprintfn("[%d] Unexpected CONTINUATION frame", session.session_id);
+                send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+        }
+
         // Handle frame by type
         switch (frame_type)
         {
@@ -528,8 +560,7 @@ fn void process_frames(H2Session* session)
                 // PRIORITY frames are parsed but ignored (RFC 9113 deprecates them)
                 io::printfn("[%d] PRIORITY frame (ignored)", session.session_id);
             case FRAME_CONTINUATION:
-                // TODO: Implement CONTINUATION handling
-                io::printfn("[%d] CONTINUATION frame (not implemented)", session.session_id);
+                handle_continuation(session, flags, stream_id, payload);
             default:
                 // Unknown frame types are ignored (RFC 9113 §4.1)
                 io::printfn("[%d] Unknown frame type %d (ignored)", session.session_id, frame_type);
@@ -743,9 +774,25 @@ fn void handle_window_update(H2Session* session, uint stream_id, char[] payload)
     // Update flow control window
     if (stream_id == 0)
     {
+        // Connection-level WINDOW_UPDATE
         session.connection_window += (int)increment;
     }
-    // TODO: Track per-stream windows
+    else
+    {
+        // Stream-level WINDOW_UPDATE
+        stream::Stream* stream_state = get_or_create_stream(session, stream_id);
+
+        // Transition stream state machine
+        if (catch err = stream::on_window_update_received(stream_state, increment))
+        {
+            io::eprintfn("[%d] Stream %d: Error processing WINDOW_UPDATE: %s",
+                         session.session_id, stream_id, @typeid(err).nameof);
+            return;
+        }
+
+        io::printfn("[%d] Stream %d send_window: %d", session.session_id, stream_id,
+                    stream_state.send_window);
+    }
 }
 
 /**
@@ -767,15 +814,102 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
         session.last_stream_id = stream_id;
     }
 
+    bool end_headers = (flags & FLAG_END_HEADERS) != 0;
+    bool end_stream = (flags & FLAG_END_STREAM) != 0;
+
+    if (!end_headers)
+    {
+        // HEADERS without END_HEADERS - expect CONTINUATION frames
+        io::printfn("[%d] HEADERS without END_HEADERS, expecting CONTINUATION", session.session_id);
+        session.expecting_continuation = true;
+        session.continuation_stream_id = stream_id;
+        session.continuation_end_stream = end_stream;  // Save END_STREAM for when CONTINUATION completes
+
+        // Start accumulating header block fragments
+        session.header_block_buffer.clear();
+        session.header_block_buffer.append((String)payload);
+
+        // Note: Don't transition stream state yet - wait for END_HEADERS
+        return;
+    }
+
+    // END_HEADERS set - process complete header block
+    // Get stream state
+    stream::Stream* stream_state = get_or_create_stream(session, stream_id);
+
+    // Transition stream state machine
+    if (catch err = stream::on_headers_received(stream_state, end_stream))
+    {
+        io::eprintfn("[%d] Stream %d: Error processing HEADERS: %s",
+                     session.session_id, stream_id, @typeid(err).nameof);
+        return;
+    }
+
+    io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
+                stream::get_state_name(stream_state.state));
+
     // TODO: HPACK decode headers
     // For now, just send a simple 200 OK response
-
-    bool end_stream = (flags & FLAG_END_STREAM) != 0;
 
     if (end_stream)
     {
         // Client finished sending, respond with 200 OK
         send_simple_response(session, stream_id);
+    }
+}
+
+/**
+ * Handle CONTINUATION frame (RFC 9113 §6.10)
+ */
+fn void handle_continuation(H2Session* session, char flags, uint stream_id, char[] payload)
+{
+    io::printfn("[%d] CONTINUATION on stream %d (len=%d)", session.session_id, stream_id, payload.len);
+
+    // Append fragment to accumulated header block
+    session.header_block_buffer.append((String)payload);
+
+    bool end_headers = (flags & FLAG_END_HEADERS) != 0;
+
+    if (end_headers)
+    {
+        // Complete header block received
+        io::printfn("[%d] CONTINUATION with END_HEADERS, complete header block size: %d",
+                    session.session_id, session.header_block_buffer.len());
+
+        // Get stream state
+        stream::Stream* stream_state = get_or_create_stream(session, stream_id);
+
+        // Transition stream state machine using END_STREAM from original HEADERS
+        bool end_stream = session.continuation_end_stream;
+        if (catch err = stream::on_headers_received(stream_state, end_stream))
+        {
+            io::eprintfn("[%d] Stream %d: Error processing CONTINUATION: %s",
+                         session.session_id, stream_id, @typeid(err).nameof);
+            session.expecting_continuation = false;
+            session.header_block_buffer.clear();
+            return;
+        }
+
+        io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
+                    stream::get_state_name(stream_state.state));
+
+        // Clear CONTINUATION state
+        session.expecting_continuation = false;
+
+        // TODO: HPACK decode complete header block from session.header_block_buffer
+        // For now, just send a simple 200 OK response
+        if (end_stream)
+        {
+            send_simple_response(session, stream_id);
+        }
+
+        // Clear buffer for next header block
+        session.header_block_buffer.clear();
+    }
+    else
+    {
+        // More CONTINUATION frames expected
+        io::printfn("[%d] CONTINUATION without END_HEADERS, waiting for more", session.session_id);
     }
 }
 
@@ -792,6 +926,22 @@ fn void handle_data(H2Session* session, char flags, uint stream_id, char[] paylo
 
     io::printfn("[%d] DATA on stream %d (len=%d)", session.session_id, stream_id, payload.len);
 
+    // Get stream state
+    stream::Stream* stream_state = get_or_create_stream(session, stream_id);
+
+    bool end_stream = (flags & FLAG_END_STREAM) != 0;
+
+    // Transition stream state machine
+    if (catch err = stream::on_data_received(stream_state, (uint)payload.len, end_stream))
+    {
+        io::eprintfn("[%d] Stream %d: Error processing DATA: %s",
+                     session.session_id, stream_id, @typeid(err).nameof);
+        return;
+    }
+
+    io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
+                stream::get_state_name(stream_state.state));
+
     // Update connection window
     if (payload.len > 0)
     {
@@ -800,7 +950,6 @@ fn void handle_data(H2Session* session, char flags, uint stream_id, char[] paylo
         send_window_update(session, stream_id, (uint)payload.len);
     }
 
-    bool end_stream = (flags & FLAG_END_STREAM) != 0;
     if (end_stream)
     {
         send_simple_response(session, stream_id);
@@ -828,7 +977,18 @@ fn void handle_rst_stream(H2Session* session, uint stream_id, char[] payload)
                       ((uint)payload[2] << 8) | (uint)payload[3];
 
     io::printfn("[%d] RST_STREAM: stream=%d error=%d", session.session_id, stream_id, error_code);
-    // Stream is now closed - nothing more to do
+
+    // Get stream state
+    stream::Stream* stream_state = get_or_create_stream(session, stream_id);
+
+    // Transition stream to CLOSED state
+    stream::on_rst_stream_received(stream_state, (stream::ErrorCode)error_code);
+
+    io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
+                stream::get_state_name(stream_state.state));
+
+    // Clean up stream
+    close_stream(session, stream_id);
 }
 
 // ============================================================================
