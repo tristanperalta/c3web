@@ -907,7 +907,7 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
         return;
     }
 
-    io::printfn("[%d] HEADERS on stream %d (len=%d)", session.session_id, stream_id, payload.len);
+    io::printfn("[%d] HEADERS on stream %d (len=%d, flags=0x%02x)", session.session_id, stream_id, payload.len, flags);
 
     // Track stream ID
     if (stream_id > session.last_stream_id)
@@ -917,6 +917,48 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
 
     bool end_headers = (flags & FLAG_END_HEADERS) != 0;
     bool end_stream = (flags & FLAG_END_STREAM) != 0;
+    bool padded = (flags & FLAG_PADDED) != 0;
+    bool priority = (flags & FLAG_PRIORITY) != 0;
+
+    // Extract header block fragment from payload (RFC 9113 §6.2)
+    // Frame format: [Pad Length (1)] [E|Stream Dep (4)] [Weight (1)] [Header Block] [Padding]
+    usz offset = 0;
+    usz pad_length = 0;
+
+    if (padded)
+    {
+        if (payload.len < 1)
+        {
+            send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+            return;
+        }
+        pad_length = (usz)payload[0];
+        offset = 1;
+    }
+
+    if (priority)
+    {
+        // E (1 bit) + Stream Dependency (31 bits) + Weight (8 bits) = 5 bytes
+        if (payload.len < offset + 5)
+        {
+            send_goaway(session, session.last_stream_id, ERR_FRAME_SIZE_ERROR);
+            return;
+        }
+        offset += 5;
+    }
+
+    // Validate padding doesn't exceed remaining payload
+    if (pad_length > payload.len - offset)
+    {
+        send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+        return;
+    }
+
+    // Extract header block fragment (excluding padding)
+    usz fragment_len = payload.len - offset - pad_length;
+    char[] header_block_fragment = payload[offset..][:fragment_len];
+    io::printfn("[%d] Header block fragment: %d bytes (pad=%d, priority=%s)",
+                session.session_id, header_block_fragment.len, pad_length, priority ? "yes" : "no");
 
     if (!end_headers)
     {
@@ -928,7 +970,7 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
 
         // Start accumulating header block fragments
         session.header_block_buffer.clear();
-        session.header_block_buffer.append((String)payload);
+        session.header_block_buffer.append((String)header_block_fragment);
 
         // Note: Don't transition stream state yet - wait for END_HEADERS
         return;
@@ -950,7 +992,7 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
                 stream::get_state_name(stream_state.state));
 
     // HPACK decode headers
-    hpack::HeaderField[]? decoded_headers = hpack::decode_header_block(payload);
+    hpack::HeaderField[]? decoded_headers = hpack::decode_header_block(header_block_fragment);
     if (catch err = decoded_headers)
     {
         io::eprintfn("[%d] Stream %d: HPACK decoding failed: %s",
