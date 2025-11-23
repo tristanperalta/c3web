@@ -207,10 +207,21 @@ fn String? decode_string(char[]* data, usz* pos) {
  * Returns an array of header fields
  */
 fn HeaderField[]? decode_header_block(char[] data) {
+    return decode_header_block_with_settings(data, 4096);  // Default max table size
+}
+
+/**
+ * Decode header block with configurable max dynamic table size
+ */
+fn HeaderField[]? decode_header_block_with_settings(char[] data, usz max_dynamic_table_size) {
     // Use a fixed-size buffer for headers
     HeaderField[128] headers;
     usz header_count = 0;
     usz pos = 0;
+
+    // Track if we've seen regular header fields (RFC 7541 Section 4.2)
+    // Dynamic table size updates MUST occur at the beginning of the header block
+    bool seen_regular_header = false;
 
     while (pos < data.len) {
         if (header_count >= headers.len) {
@@ -222,6 +233,7 @@ fn HeaderField[]? decode_header_block(char[] data) {
         // Indexed Header Field (RFC 7541 Section 6.1)
         // Starts with 1xxxxxxx
         if (first_byte & 0x80) {
+            seen_regular_header = true;
             uint index = decode_integer(&data, &pos, 7)!;
 
             // Index 0 is invalid (RFC 7541 Section 2.3.1)
@@ -241,6 +253,7 @@ fn HeaderField[]? decode_header_block(char[] data) {
         // Literal Header Field with Incremental Indexing (RFC 7541 Section 6.2.1)
         // Starts with 01xxxxxx
         else if (first_byte & 0x40) {
+            seen_regular_header = true;
             uint index = decode_integer(&data, &pos, 6)!;
 
             String name;
@@ -260,14 +273,25 @@ fn HeaderField[]? decode_header_block(char[] data) {
         // Dynamic Table Size Update (RFC 7541 Section 6.3)
         // Starts with 001xxxxx
         else if (first_byte & 0x20) {
-            // Just consume the size update for now
-            decode_integer(&data, &pos, 5)!;
+            // RFC 7541 Section 4.2: Dynamic table size updates MUST occur at the
+            // beginning of the first header block following a change to SETTINGS
+            if (seen_regular_header) {
+                return COMPRESSION_ERROR?;  // Size update after headers is an error
+            }
+
+            uint new_size = decode_integer(&data, &pos, 5)!;
+
+            // RFC 7541 Section 6.3: New size MUST be <= the value from SETTINGS
+            if (new_size > max_dynamic_table_size) {
+                return COMPRESSION_ERROR?;  // Exceeds maximum allowed size
+            }
         }
         // Literal Header Field without Indexing (RFC 7541 Section 6.2.2)
         // Starts with 0000xxxx
         // Literal Header Field Never Indexed (RFC 7541 Section 6.2.3)
         // Starts with 0001xxxx
         else {
+            seen_regular_header = true;
             uint index = decode_integer(&data, &pos, 4)!;
 
             String name;

@@ -229,6 +229,12 @@ fn void? validate_stream_creation(H2Session* session, uint stream_id, char frame
         return;  // Other frames don't create streams
     }
 
+    // Check if stream already exists - if so, this is trailer HEADERS, skip validation
+    if (session.streams.has_key(stream_id))
+    {
+        return;  // Stream already exists - this is a trailer or continuation
+    }
+
     // Client streams must be odd
     if (!stream::is_valid_client_stream_id(stream_id))
     {
@@ -282,7 +288,9 @@ fn stream::Stream* get_or_create_stream(H2Session* session, uint stream_id)
 }
 
 /**
- * Close and remove stream
+ * Close stream (but keep in map for state validation)
+ * Streams are kept in map with CLOSED state so we can detect
+ * protocol violations when frames arrive on closed streams.
  */
 fn void close_stream(H2Session* session, uint stream_id)
 {
@@ -291,8 +299,10 @@ fn void close_stream(H2Session* session, uint stream_id)
         if (s.state != stream::StreamState.CLOSED)
         {
             session.active_stream_count--;
+            s.state = stream::StreamState.CLOSED;
         }
-        session.streams.remove(stream_id);
+        // Don't remove - keep in map for validation of future frames
+        // This allows us to detect STREAM_CLOSED errors per RFC 9113
     }
 }
 
@@ -394,6 +404,29 @@ fn uint validate_http2_headers(hpack::HeaderField[] headers)
     }
 
     return 0;  // Valid
+}
+
+/**
+ * Parse Content-Length header value
+ * Returns the length value or fault on error
+ */
+fn usz? parse_content_length(String value)
+{
+    if (value.len == 0)
+    {
+        return stream::STREAM_ERROR?;
+    }
+
+    usz result = 0;
+    foreach (c : value)
+    {
+        if (c < '0' || c > '9')
+        {
+            return stream::STREAM_ERROR?;  // Invalid character
+        }
+        result = result * 10 + (usz)(c - '0');
+    }
+    return result;
 }
 
 int global_session_id = 0;
@@ -586,7 +619,17 @@ fn void process_frames(H2Session* session)
         if (catch err = frame::validate_frame(&header, payload, &session.frame_settings))
         {
             io::eprintfn("[%d] Frame validation error: %s", session.session_id, @typeid(err).nameof);
-            send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
+            // Map fault type to correct HTTP/2 error code
+            uint error_code = ERR_PROTOCOL_ERROR;
+            if (err == frame::FRAME_SIZE_ERROR)
+            {
+                error_code = ERR_FRAME_SIZE_ERROR;
+            }
+            else if (err == frame::FLOW_CONTROL_ERROR)
+            {
+                error_code = ERR_FLOW_CONTROL_ERROR;
+            }
+            send_goaway(session, session.last_stream_id, error_code);
             return;
         }
 
@@ -1042,6 +1085,10 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
     // Get stream state
     stream::Stream* stream_state = get_or_create_stream(session, stream_id);
 
+    // Check if this is a trailer (stream already OPEN means we received initial headers)
+    // Trailers are HEADERS frames sent after the request body
+    bool is_trailer = (stream_state.state == stream::StreamState.OPEN);
+
     // Transition stream state machine
     if (catch err = stream::on_headers_received(stream_state, end_stream))
     {
@@ -1050,8 +1097,8 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
         return;
     }
 
-    io::printfn("[%d] Stream %d state: %s", session.session_id, stream_id,
-                stream::get_state_name(stream_state.state));
+    io::printfn("[%d] Stream %d state: %s%s", session.session_id, stream_id,
+                stream::get_state_name(stream_state.state), is_trailer ? " (trailer)" : "");
 
     // HPACK decode headers
     hpack::HeaderField[]? decoded_headers = hpack::decode_header_block(header_block_fragment);
@@ -1066,12 +1113,36 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
     hpack::HeaderField[] headers = decoded_headers;
 
     // Validate HTTP/2 headers (RFC 9113 §8.1.2)
-    uint validation_error = validate_http2_headers(headers);
-    if (validation_error != 0)
+    // Skip validation for trailers - they don't have pseudo-headers
+    if (!is_trailer)
     {
-        io::eprintfn("[%d] Stream %d: Header validation failed", session.session_id, stream_id);
-        send_rst_stream(session, stream_id, validation_error);
-        return;
+        uint validation_error = validate_http2_headers(headers);
+        if (validation_error != 0)
+        {
+            io::eprintfn("[%d] Stream %d: Header validation failed", session.session_id, stream_id);
+            send_rst_stream(session, stream_id, validation_error);
+            return;
+        }
+    }
+
+    // Extract Content-Length if present (RFC 9113 §8.1.2.6)
+    foreach (header : headers)
+    {
+        if (header.name == "content-length")
+        {
+            if (try content_len = parse_content_length(header.value))
+            {
+                stream_state.expected_bytes = content_len;
+                stream_state.has_content_length = true;
+            }
+            else
+            {
+                // Invalid Content-Length value
+                send_rst_stream(session, stream_id, ERR_PROTOCOL_ERROR);
+                return;
+            }
+            break;
+        }
     }
 
     io::printfn("[%d] Stream %d: Decoded %d headers", session.session_id, stream_id, headers.len);
@@ -1481,7 +1552,8 @@ fn void on_goaway_write_complete(tcp::TcpConnection* conn, int status, void* use
     H2Session* session = (H2Session*)user_data;
     io::printfn("[%d] GOAWAY sent, closing connection", session.session_id);
     session.state = ConnectionState.CLOSED;
-    // Only release the write callback's reference
-    // Session cleanup happens when read EOF is received (in on_read)
-    session.release();
+    // Stop reading and close the connection immediately after GOAWAY
+    // h2spec expects active connection closure, not passive wait for EOF
+    (void)conn.stop_read();  // Ignore error - we're closing anyway
+    session.release();  // Release write callback ref - triggers dealloc
 }

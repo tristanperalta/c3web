@@ -13,7 +13,7 @@ import std::io;
 /**
  * Frame validation errors
  */
-faultdef FRAME_SIZE_ERROR, PROTOCOL_ERROR, COMPRESSION_ERROR;
+faultdef FRAME_SIZE_ERROR, PROTOCOL_ERROR, COMPRESSION_ERROR, FLOW_CONTROL_ERROR;
 
 /**
  * HTTP/2 Frame Flags (RFC 9113 Section 4.1)
@@ -306,9 +306,10 @@ fn void? validate_setting_value(ushort identifier, uint value) {
             // Any value is valid
             return;
         case 0x4: // SETTINGS_INITIAL_WINDOW_SIZE
-            // Must not exceed 2^31-1 (2147483647)
+            // Must not exceed 2^31-1 (2147483647) - RFC 9113 Section 6.5.2
+            // Exceeding this is a FLOW_CONTROL_ERROR, not PROTOCOL_ERROR
             if (value > 0x7FFFFFFF) {
-                return PROTOCOL_ERROR?;
+                return FLOW_CONTROL_ERROR?;
             }
             return;
         case 0x5: // SETTINGS_MAX_FRAME_SIZE
