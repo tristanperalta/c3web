@@ -666,6 +666,13 @@ fn void process_frames(H2Session* session)
         io::printfn("[%d] Frame: type=%d flags=0x%02x stream=%d len=%d",
                     session.session_id, frame_type, flags, stream_id, length);
 
+        // Write frame info to debug file
+        if (try f = io::file::open("/tmp/h2_debug.log", "a")) {
+            io::fprintfn(&f, "[%d] Frame: type=%d flags=0x%02x stream=%d len=%d",
+                      session.session_id, frame_type, flags, stream_id, length)!!;
+            f.close()!!;
+        }
+
         // Frame validation
         frame::FrameHeader header = (frame::FrameHeader){
             .length = length,
@@ -1139,6 +1146,13 @@ fn void handle_window_update(H2Session* session, uint stream_id, char[] payload)
  */
 fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] payload)
 {
+    // Write to debug file
+    if (try f = io::file::open("/tmp/h2_debug.log", "a")) {
+        io::fprintfn(&f, "[%d] HEADERS on stream %d (len=%d, flags=0x%02x)",
+                  session.session_id, stream_id, payload.len, flags)!!;
+        f.close()!!;
+    }
+
     if (stream_id == 0)
     {
         send_goaway(session, session.last_stream_id, ERR_PROTOCOL_ERROR);
@@ -1327,10 +1341,18 @@ fn void handle_headers(H2Session* session, char flags, uint stream_id, char[] pa
  */
 fn void handle_continuation(H2Session* session, char flags, uint stream_id, char[] payload)
 {
-    io::printfn("[%d] CONTINUATION on stream %d (len=%d)", session.session_id, stream_id, payload.len);
+    // Write to debug file
+    if (try f = io::file::open("/tmp/h2_debug.log", "a")) {
+        io::fprintfn(&f, "[%d] CONTINUATION on stream %d (len=%d, flags=0x%02x, buffer_before=%d)",
+                  session.session_id, stream_id, payload.len, flags, session.header_block_buffer.len())!!;
+        f.close()!!;
+    }
+    io::printfn("[%d] CONTINUATION on stream %d (len=%d, buffer_before=%d)",
+                session.session_id, stream_id, payload.len, session.header_block_buffer.len());
 
     // Append fragment to accumulated header block
     session.header_block_buffer.append((String)payload);
+    io::printfn("[%d] CONTINUATION buffer_after=%d", session.session_id, session.header_block_buffer.len());
 
     bool end_headers = (flags & FLAG_END_HEADERS) != 0;
 
@@ -1359,11 +1381,21 @@ fn void handle_continuation(H2Session* session, char flags, uint stream_id, char
 
         // HPACK decode complete header block
         char[] header_block = (char[])session.header_block_buffer.str_view();
+        io::printfn("[%d] Stream %d: Decoding header block of %d bytes",
+                     session.session_id, stream_id, header_block.len);
+        // Hex dump first 32 bytes
+        io::printf("[%d] First bytes: ", session.session_id);
+        for (usz i = 0; i < header_block.len && i < 32; i++) {
+            io::printf("%02x ", (uint)(char)header_block[i]);
+        }
+        io::printfn("");
+        io::stdout().flush()!!;
         hpack::HeaderField[]? decoded_headers = hpack::decode_header_block(header_block);
         if (catch err = decoded_headers)
         {
-            io::eprintfn("[%d] Stream %d: HPACK decoding failed: %s",
-                         session.session_id, stream_id, @typeid(err).nameof);
+            io::printfn("[%d] Stream %d: HPACK decoding failed: %s (block size=%d)",
+                         session.session_id, stream_id, @typeid(err).nameof, header_block.len);
+            io::stdout().flush()!!;
             send_goaway(session, session.last_stream_id, ERR_COMPRESSION_ERROR);
             session.expecting_continuation = false;
             session.header_block_buffer.clear();
@@ -1612,6 +1644,12 @@ fn void send_ping_ack(H2Session* session, char[] opaque_data)
  */
 fn void send_goaway(H2Session* session, uint last_stream_id, uint error_code)
 {
+    // Write to debug file
+    if (try f = io::file::open("/tmp/h2_debug.log", "a")) {
+        io::fprintfn(&f, "[%d] SENDING GOAWAY: last_stream=%d error=%d", session.session_id, last_stream_id, error_code)!!;
+        f.close()!!;
+    }
+
     // Prevent double GOAWAY - once we're closing, ignore further errors
     if (session.state == ConnectionState.CLOSING || session.state == ConnectionState.CLOSED) {
         return;

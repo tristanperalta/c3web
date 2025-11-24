@@ -177,3 +177,196 @@ fn void test_h2spec_cases() @test
 
     io::printn("[OK] h2spec invalid index case");
 }
+
+/**
+ * Test Huffman padding validation (RFC 7541 Section 5.2)
+ *
+ * RFC 7541: "A padding NOT consisting entirely of ones MUST be treated as a decoding error."
+ * RFC 7541: "A padding strictly longer than 7 bits MUST be treated as a decoding error."
+ */
+fn void test_huffman_padding_not_ones() @test
+{
+    // '0' encodes as 00000 (5 bits)
+    // 0x06 = 00000110 = '0' (5 bits) + 110 (3 bits padding)
+    // Padding 110 is NOT all 1s (should be 111), so this is invalid
+    char[] data_invalid_padding = { 0x06 };
+    String? result = hpack::decode_huffman(data_invalid_padding);
+    assert(@catch(result) == hpack::INVALID_HUFFMAN);
+
+    // Also test: 0x04 = 00000100 = '0' (5 bits) + 100 (3 bits with zeros)
+    char[] data_zeros_padding = { 0x04 };
+    String? result2 = hpack::decode_huffman(data_zeros_padding);
+    assert(@catch(result2) == hpack::INVALID_HUFFMAN);
+
+    io::printn("[OK] Huffman padding not all 1s rejected");
+}
+
+/**
+ * Test Huffman padding >7 bits detection (RFC 7541 Section 5.2)
+ * h2spec test: hpack/5.2/1
+ *
+ * RFC 7541: "A padding strictly longer than 7 bits MUST be treated as a decoding error."
+ *
+ * When all remaining bits are 1s and there are >7 of them, this is excessive
+ * padding, not more valid symbols (even if 8 bits of 1s could decode as ';').
+ */
+fn void test_huffman_padding_too_long() @test
+{
+    // 'a' (0x61) encodes as 00011 (5 bits)
+    // Valid: 0x1f = 00011111 = 'a' (5 bits) + 3 bits padding = valid
+    char[] data_valid = { 0x1f };
+    String valid_result = hpack::decode_huffman(data_valid)!!;
+    assert(valid_result == "a");
+
+    // Invalid: 0x1f 0xff = 00011111 11111111 = 'a' (5 bits) + 11 bits of 1s
+    // The 11 bits of 1s could decode as ';' + 3-bit padding, but since ALL
+    // remaining bits after 'a' are 1s and there are >7 of them, this is
+    // invalid padding, not a valid ';' character.
+    char[] data_too_much_padding = { 0x1f, 0xff };
+    String? result = hpack::decode_huffman(data_too_much_padding);
+    assert(@catch(result) == hpack::INVALID_HUFFMAN);
+
+    io::printn("[OK] Huffman padding >7 bits rejected (hpack/5.2/1)");
+}
+
+/**
+ * Test Huffman EOS symbol detection (RFC 7541 Section 5.2)
+ * h2spec test: hpack/5.2/3
+ *
+ * RFC 7541: "A Huffman-encoded string literal containing the EOS symbol
+ * MUST be treated as a decoding error."
+ *
+ * EOS symbol = 30 bits of 1s (0x3FFFFFFF)
+ */
+fn void test_huffman_eos_in_string() @test
+{
+    // EOS is 30 bits of 1s: 111111111111111111111111111111
+    //
+    // 4 bytes of 0xFF = 32 bits of 1s, which contains the full EOS pattern
+    // The decoder should detect EOS before/while decoding these bits
+
+    char[] data_with_eos = { 0xFF, 0xFF, 0xFF, 0xFF };  // 32 bits of 1s
+    String? result = hpack::decode_huffman(data_with_eos);
+    assert(@catch(result) == hpack::EOS_IN_STRING);
+
+    io::printn("[OK] Huffman EOS in string rejected (hpack/5.2/3)");
+}
+
+/**
+ * Test valid Huffman encoding still works
+ */
+fn void test_huffman_valid_encoding() @test
+{
+    // '0' = 00000 (5 bits), needs 3-bit padding of 1s
+    // 0x07 = 00000111 = '0' with proper 3-bit padding
+    char[] data_valid = { 0x07 };
+    String result = hpack::decode_huffman(data_valid)!!;
+    assert(result == "0");
+
+    // Valid 6-bit padding
+    // Two '0's: 00000 00000 (10 bits) + 111111 (6-bit padding) = 16 bits
+    // Binary: 0000000000111111 = 0x00, 0x3F
+    char[] data_two_zeros = { 0x00, 0x3F };
+    String result2 = hpack::decode_huffman(data_two_zeros)!!;
+    assert(result2 == "00");
+
+    io::printn("[OK] Valid Huffman encoding works");
+}
+
+/**
+ * Test that EOS in Huffman string within a header block returns COMPRESSION_ERROR
+ * h2spec test: hpack/5.2/3
+ *
+ * This tests the full flow: header block -> decode_string -> decode_huffman -> EOS detection
+ * The server should respond with GOAWAY(COMPRESSION_ERROR), not process the request.
+ */
+fn void test_header_block_with_eos_returns_compression_error() @test
+{
+    // Build a header block with a Huffman-encoded value containing EOS
+    // Format: 0x00 (literal without indexing, new name) + name + value
+    //
+    // Name: plain string "x" (0x01 0x78)
+    // Value: Huffman string with EOS (0x84 = H-bit + length 4, then 0xFF 0xFF 0xFF 0xFF)
+    //
+    // The 4 bytes of 0xFF contain the 30-bit EOS pattern
+    char[] header_block = {
+        0x00,       // Literal without indexing, new name (index 0)
+        0x01, 'x',  // Name: plain string "x" (length 1, no H-bit)
+        0x84,       // Value: Huffman-encoded, length 4 (H-bit set = 0x80 | 4)
+        0xFF, 0xFF, 0xFF, 0xFF  // 32 bits of 1s - contains EOS (30 bits of 1s)
+    };
+
+    // This should fail with COMPRESSION_ERROR because EOS is in the Huffman string
+    hpack::HeaderField[]? result = hpack::decode_header_block(header_block);
+
+    // Must fail - EOS in string is a decoding error per RFC 7541
+    assert(@catch(result) == hpack::COMPRESSION_ERROR,
+           "Expected COMPRESSION_ERROR for EOS in Huffman string within header block");
+
+    io::printn("[OK] Header block with EOS returns COMPRESSION_ERROR (hpack/5.2/3)");
+}
+
+/**
+ * Test decoding of fragmented header blocks (CONTINUATION frame simulation)
+ * h2spec test: http2/6.10/1
+ *
+ * Header blocks may be split across HEADERS + multiple CONTINUATION frames.
+ * When concatenated, they must decode correctly.
+ */
+fn void test_decode_fragmented_header_block() @test
+{
+    // Full header block: :method GET (0x82) + :path / (0x84) + :scheme https (0x87)
+    // Split into 3 fragments to simulate HEADERS + 2 CONTINUATION frames
+    char[] fragment1 = { 0x82 };        // :method GET
+    char[] fragment2 = { 0x84 };        // :path /
+    char[] fragment3 = { 0x87 };        // :scheme https
+
+    // Concatenate fragments (simulating what the server does with CONTINUATION)
+    char[3] full_block;
+    full_block[0] = fragment1[0];
+    full_block[1] = fragment2[0];
+    full_block[2] = fragment3[0];
+
+    // Decode the concatenated header block
+    hpack::HeaderField[]? result = hpack::decode_header_block(full_block[..]);
+    hpack::HeaderField[] headers = result!!;
+
+    assert(headers.len == 3, "Expected 3 headers from fragmented block");
+    assert(headers[0].name == ":method" && headers[0].value == "GET");
+    assert(headers[1].name == ":path" && headers[1].value == "/");
+    assert(headers[2].name == ":scheme" && headers[2].value == "https");
+
+    io::printn("[OK] Fragmented header block decodes correctly (http2/6.10/1)");
+}
+
+/**
+ * Test decoding a more complex fragmented header block with literal headers
+ * This simulates what h2spec sends in the CONTINUATION test
+ */
+fn void test_decode_fragmented_literal_headers() @test
+{
+    // Create a header block with indexed + literal headers
+    // :method GET (0x82) + custom header "x-test: value"
+    //
+    // Literal without indexing, indexed name (header name from index):
+    // 0x0F 0x00 = literal without indexing, index 0 (new name follows)
+    // But simpler: use 0x00 for literal new name
+    char[] header_block = {
+        0x82,                                    // :method GET
+        0x84,                                    // :path /
+        0x87,                                    // :scheme https
+        0x41,                                    // :authority (index 1) with literal value
+        0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't'  // "localhost"
+    };
+
+    hpack::HeaderField[]? result = hpack::decode_header_block(header_block);
+    hpack::HeaderField[] headers = result!!;
+
+    assert(headers.len == 4, "Expected 4 headers");
+    assert(headers[0].name == ":method" && headers[0].value == "GET");
+    assert(headers[1].name == ":path" && headers[1].value == "/");
+    assert(headers[2].name == ":scheme" && headers[2].value == "https");
+    assert(headers[3].name == ":authority" && headers[3].value == "localhost");
+
+    io::printn("[OK] Complex fragmented header block decodes correctly");
+}

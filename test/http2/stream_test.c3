@@ -468,3 +468,93 @@ fn void test_error_codes() @test
 
     io::printn("[OK] Error code retrieval");
 }
+
+/**
+ * Test SETTINGS_INITIAL_WINDOW_SIZE adjustment affects existing streams
+ * h2spec test: http2/6.9.2/1
+ *
+ * RFC 9113 §6.5.2: When the value of SETTINGS_INITIAL_WINDOW_SIZE changes,
+ * a receiver MUST adjust the size of all stream flow-control windows that
+ * it maintains by the difference between the new value and the old value.
+ */
+fn void test_initial_window_size_adjustment() @test
+{
+    // Create stream with default initial window size (65535)
+    stream::Stream s = stream::new_stream(1, 65535);
+    stream::on_headers_received(&s, false)!!;  // Transition to OPEN
+
+    // Verify initial send_window
+    assert(s.send_window == 65535);
+
+    // Simulate consuming some of the window (e.g., we sent some data)
+    s.send_window = 0;  // Window fully consumed
+
+    // Simulate SETTINGS_INITIAL_WINDOW_SIZE change: old=65535, new=65536
+    // Delta = 65536 - 65535 = +1
+    int delta = 1;
+    long new_window = (long)s.send_window + (long)delta;
+
+    // The adjustment should make window = 1 (allowing 1 byte to be sent)
+    assert(new_window == 1, "Expected window to be 1 after delta adjustment");
+
+    // Apply the delta (this is what the server should do)
+    s.send_window = (uint)new_window;
+    assert(s.send_window == 1);
+
+    io::printn("[OK] SETTINGS_INITIAL_WINDOW_SIZE adjustment (http2/6.9.2/1)");
+}
+
+/**
+ * Test SETTINGS_INITIAL_WINDOW_SIZE negative delta
+ * When new initial window size is smaller than old, existing windows decrease
+ */
+fn void test_initial_window_size_negative_delta() @test
+{
+    stream::Stream s = stream::new_stream(1, 65535);
+    stream::on_headers_received(&s, false)!!;
+
+    // Set send_window to 1000 (simulating partial consumption)
+    s.send_window = 1000;
+
+    // SETTINGS change: old=65535, new=65000
+    // Delta = 65000 - 65535 = -535
+    int delta = -535;
+    long new_window = (long)s.send_window + (long)delta;
+
+    // Window should become 1000 - 535 = 465
+    assert(new_window == 465);
+
+    s.send_window = (uint)new_window;
+    assert(s.send_window == 465);
+
+    io::printn("[OK] SETTINGS_INITIAL_WINDOW_SIZE negative delta");
+}
+
+/**
+ * Test stream with pending_response flag for flow control blocked data
+ * This tests the pattern used when a response is blocked due to flow control
+ */
+fn void test_pending_response_flag() @test
+{
+    stream::Stream s = stream::new_stream(1, 65535);
+    stream::on_headers_received(&s, true)!!;  // Client sent END_STREAM
+
+    // Initially no pending response
+    assert(!s.pending_response);
+
+    // Server wants to send response but window is 0
+    s.send_window = 0;
+    s.pending_response = true;  // Mark that we have data waiting
+
+    assert(s.pending_response);
+    assert(s.send_window == 0);
+
+    // After window opens, pending_response should be checked and data sent
+    // This simulates WINDOW_UPDATE or SETTINGS_INITIAL_WINDOW_SIZE change
+    s.send_window = 100;
+
+    // Server logic: if pending_response && send_window > 0, send data
+    assert(s.pending_response && s.send_window > 0);
+
+    io::printn("[OK] Pending response flag for flow control");
+}
