@@ -926,6 +926,23 @@ fn void handle_settings(H2Session* session, char flags, uint stream_id, char[] p
                             entry = entry.next;
                         }
                     }
+
+                    // RFC 9113 §6.9.2: After adjusting windows, check for pending data
+                    // that can now be sent (window may have increased from 0)
+                    foreach (entry2 : session.streams.table)
+                    {
+                        while (entry2)
+                        {
+                            stream::Stream* s = &entry2.value;
+                            if (s.pending_response && s.send_window > 0)
+                            {
+                                io::printfn("[%d] Stream %d: flushing pending data (window now %d)",
+                                            session.session_id, s.id, s.send_window);
+                                send_pending_data(session, s.id, s);
+                            }
+                            entry2 = entry2.next;
+                        }
+                    }
                 }
                 session.remote_initial_window_size = value;
                 io::printfn("[%d] Initial window size now: %d", session.session_id, value);
