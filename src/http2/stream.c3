@@ -75,7 +75,7 @@ struct Stream {
     uint id;                  // Stream identifier (RFC 9113 §5.1.1)
     StreamState state;        // Current state
     uint recv_window;         // Receive flow control window
-    uint send_window;         // Send flow control window
+    int send_window;          // Send flow control window (can be negative per RFC 9113)
     usz bytes_received;       // Bytes received (for Content-Length validation)
     usz expected_bytes;       // Expected bytes from Content-Length header
     bool has_content_length;  // Whether Content-Length was specified
@@ -91,7 +91,7 @@ fn Stream new_stream(uint stream_id, uint initial_window_size = 65535) {
         .id = stream_id,
         .state = IDLE,
         .recv_window = initial_window_size,
-        .send_window = initial_window_size,
+        .send_window = (int)initial_window_size,
         .bytes_received = 0,
         .expected_bytes = 0,
         .has_content_length = false,
@@ -292,11 +292,13 @@ fn void? on_window_update_received(Stream* stream, uint window_increment) {
 
     // Update send window
     // Check for overflow (window size exceeds 2^31-1)
-    if (stream.send_window + window_increment > 0x7FFFFFFF) {
+    // Use long to avoid overflow in the check itself
+    long new_window = (long)stream.send_window + (long)window_increment;
+    if (new_window > 0x7FFFFFFF) {
         return STREAM_ERROR?;
     }
 
-    stream.send_window += window_increment;
+    stream.send_window = (int)new_window;
 }
 
 /**

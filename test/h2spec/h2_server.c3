@@ -920,7 +920,7 @@ fn void handle_settings(H2Session* session, char flags, uint stream_id, char[] p
                                 send_goaway(session, session.last_stream_id, ERR_FLOW_CONTROL_ERROR);
                                 return;
                             }
-                            s.send_window = (uint)new_window;
+                            s.send_window = (int)new_window;
                             io::printfn("[%d] Stream %d window adjusted by %d to %d",
                                         session.session_id, s.id, delta, s.send_window);
                             entry = entry.next;
@@ -1037,13 +1037,14 @@ fn void handle_goaway(H2Session* session, char[] payload)
  */
 fn void send_pending_data(H2Session* session, uint stream_id, stream::Stream* stream_state)
 {
-    // Fixed response body: "OK\n"
-    char[3] body = { 'O', 'K', '\n' };
-    uint body_len = 3;
+    // Fixed response body (must be >= 5 bytes for h2spec test 6.9.2.2)
+    char[5] body = { 'H', 'e', 'l', 'l', 'o' };
+    uint body_len = 5;
 
-    // Calculate how much we can send
+    // Calculate how much we can send (handle negative windows per RFC 9113 §6.9.2)
     uint bytes_to_send = body_len;
-    if (stream_state.send_window < bytes_to_send) { bytes_to_send = stream_state.send_window; }
+    if (stream_state.send_window <= 0) { bytes_to_send = 0; }
+    else if ((uint)stream_state.send_window < bytes_to_send) { bytes_to_send = (uint)stream_state.send_window; }
     if (session.connection_window > 0 && (uint)session.connection_window < bytes_to_send) {
         bytes_to_send = (uint)session.connection_window;
     }
@@ -1054,7 +1055,7 @@ fn void send_pending_data(H2Session* session, uint stream_id, stream::Stream* st
     io::printfn("[%d] Sending pending DATA: stream=%d, bytes=%d", session.session_id, stream_id, bytes_to_send);
 
     // Build DATA frame - arena allocated (freed when session ends)
-    char[] frame = allocator::alloc_array(&session.arena, char, 12);  // 9 header + 3 body max
+    char[] frame = allocator::alloc_array(&session.arena, char, 14);  // 9 header + 5 body max
     frame[0] = 0;
     frame[1] = 0;
     frame[2] = (char)bytes_to_send;  // Length
@@ -1071,7 +1072,7 @@ fn void send_pending_data(H2Session* session, uint stream_id, stream::Stream* st
     }
 
     // Update flow control windows
-    stream_state.send_window -= bytes_to_send;
+    stream_state.send_window -= (int)bytes_to_send;
     session.connection_window -= (int)bytes_to_send;
 
     // Update stream state
@@ -1783,20 +1784,28 @@ fn void send_simple_response(H2Session* session, uint stream_id)
         return;
     }
 
-    // Response body
-    char[3] body = { 'O', 'K', '\n' };
-    uint body_len = 3;
+    // Response body (must be >= 5 bytes for h2spec test 6.9.2.2)
+    char[5] body = { 'H', 'e', 'l', 'l', 'o' };
+    uint body_len = 5;
 
     // Calculate how much we can send based on flow control windows
-    // Both stream window and connection window must allow data
-    uint stream_window = stream_state.send_window;
+    // Both stream window and connection window must allow data (handle negative windows)
+    int stream_window = stream_state.send_window;
     int conn_window = session.connection_window;
 
     // Determine bytes to send (minimum of body, stream window, connection window)
     uint bytes_to_send = body_len;
-    if (stream_window < bytes_to_send) bytes_to_send = stream_window;
-    if (conn_window > 0 && (uint)conn_window < bytes_to_send) bytes_to_send = (uint)conn_window;
-    if (conn_window <= 0) bytes_to_send = 0;
+    if (stream_window <= 0) {
+        bytes_to_send = 0;
+    } else if ((uint)stream_window < bytes_to_send) {
+        bytes_to_send = (uint)stream_window;
+    }
+    if (conn_window > 0 && (uint)conn_window < bytes_to_send) {
+        bytes_to_send = (uint)conn_window;
+    }
+    if (conn_window <= 0) {
+        bytes_to_send = 0;
+    }
 
     io::printfn("[%d] Flow control: stream_window=%d, conn_window=%d, sending=%d bytes",
                 session.session_id, stream_window, conn_window, bytes_to_send);
@@ -1833,7 +1842,7 @@ fn void send_simple_response(H2Session* session, uint stream_id)
 
     // Buffer: 9 (HEADERS header) + 1 (payload) + 9 (DATA header) + bytes_to_send
     // Arena allocated (freed when session ends)
-    char[] frame = allocator::alloc_array(&session.arena, char, 22);  // Max: 10 + 12 = 22 bytes
+    char[] frame = allocator::alloc_array(&session.arena, char, 24);  // Max: 10 + 14 = 24 bytes
 
     // === HEADERS frame (10 bytes) ===
     frame[0] = 0; frame[1] = 0; frame[2] = 1;  // Length = 1 byte
@@ -1863,7 +1872,7 @@ fn void send_simple_response(H2Session* session, uint stream_id)
     }
 
     // Update flow control windows
-    stream_state.send_window -= bytes_to_send;
+    stream_state.send_window -= (int)bytes_to_send;
     session.connection_window -= (int)bytes_to_send;
 
     // Update stream state if we sent END_STREAM
@@ -1872,6 +1881,12 @@ fn void send_simple_response(H2Session* session, uint stream_id)
         (void)stream::send_end_stream(stream_state);
         io::printfn("[%d] Stream %d state after response: %s", session.session_id, stream_id,
                     stream::get_state_name(stream_state.state));
+    }
+    else
+    {
+        // Mark stream as having pending response data for WINDOW_UPDATE handler
+        stream_state.pending_response = true;
+        stream_state.headers_sent = true;
     }
 
     // Calculate actual frame size to send (use length syntax [0:len] for slice)
