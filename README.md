@@ -10,6 +10,13 @@ A HTTP implementation suite for the C3 programming language, providing HTTP/1.1,
   - Security hardening (request smuggling prevention, bare LF rejection, null byte detection)
   - Body validation with configurable size limits (413, 414 status codes)
   - HTTP version validation (505 status code)
+- **HTTP/2** (RFC 9113 compliant)
+  - Full h2spec conformance (146/146 tests passing)
+  - HPACK header compression (RFC 7541) with Huffman encoding
+  - Stream multiplexing and state machine
+  - Flow control with negative window tracking
+  - Frame parsing (DATA, HEADERS, SETTINGS, WINDOW_UPDATE, PING, GOAWAY, RST_STREAM, PRIORITY, CONTINUATION)
+  - Connection preface and SETTINGS exchange
 - **WebSocket** (RFC 6455 compliant)
   - Full Autobahn testsuite compliance (517 tests: 515 OK, 2 NON-STRICT)
   - Text and binary message support with UTF-8 validation
@@ -17,7 +24,6 @@ A HTTP implementation suite for the C3 programming language, providing HTTP/1.1,
   - Control frames (Ping/Pong/Close) with proper handling
   - permessage-deflate compression (RFC 7692)
   - Connection management with close handshake
-- HTTP/2
 - HTTP/3
 
 ## Dependencies
