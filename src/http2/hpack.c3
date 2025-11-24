@@ -12,7 +12,6 @@
  */
 module c3web::http2::hpack;
 
-import std::io;
 import std::core::mem;
 
 // HPACK Error Codes
@@ -194,18 +193,15 @@ fn String? decode_string(char[]* data, usz* pos) {
         // Huffman decoding
         char[] huffman_data = (*data)[*pos:length];
         *pos += length;
-        io::eprintfn("[HPACK] decode_string: calling decode_huffman with %d bytes", huffman_data.len);
         // RFC 7541 Section 5.2: EOS in Huffman string is a decoding error
         // Map EOS_IN_STRING to COMPRESSION_ERROR for proper HTTP/2 error handling
         String? huffman_result = decode_huffman(huffman_data);
         if (catch err = huffman_result) {
-            io::eprintfn("[HPACK] decode_string: decode_huffman returned error: %s", @typeid(err).nameof);
             if (err == EOS_IN_STRING || err == INVALID_HUFFMAN) {
                 return COMPRESSION_ERROR?;
             }
             return err?;
         }
-        io::eprintfn("[HPACK] decode_string: decode_huffman returned string of %d chars", huffman_result.len);
         return huffman_result;
     } else {
         // Plain string
@@ -244,44 +240,35 @@ fn HeaderField[]? decode_header_block_with_settings(char[] data, usz max_dynamic
     bool seen_regular_header = false;
 
     while (pos < data.len) {
-        io::eprintfn("[HPACK] Parsing header %d at pos=%d, data.len=%d", header_count, pos, data.len);
         if (header_count >= headers.len) {
             return COMPRESSION_ERROR?;  // Too many headers
         }
 
         char first_byte = data[pos];
-        io::eprintfn("[HPACK] first_byte=0x%02x", (uint)(char)first_byte);
 
         // Indexed Header Field (RFC 7541 Section 6.1)
         // Starts with 1xxxxxxx
         if (first_byte & 0x80) {
             seen_regular_header = true;
-            io::eprintfn("[HPACK] Decoding indexed header integer...");
             uint index = decode_integer(&data, &pos, 7)!;
-            io::eprintfn("[HPACK] Index decoded: %d", index);
 
             // Index 0 is invalid (RFC 7541 Section 2.3.1)
             if (index == 0) {
-                io::eprintfn("[HPACK] ERROR: Index 0 is invalid");
                 return COMPRESSION_ERROR?;
             }
 
             // Static table: indices 1-61
             if (index <= STATIC_TABLE_SIZE) {
-                io::eprintfn("[HPACK] Indexed header %d from static table", index);
                 headers[header_count++] = STATIC_TABLE[index];
             } else {
                 // Dynamic table: indices 62+ (RFC 7541 Section 2.3.3)
                 // Dynamic index 62 = newest entry (dyn_count-1)
                 uint dyn_index = index - (uint)STATIC_TABLE_SIZE - 1;  // 0-based index into our table
                 if (dyn_index >= dyn_count) {
-                    io::eprintfn("[HPACK] ERROR: Dynamic index %d out of range (have %d entries)",
-                                 dyn_index, dyn_count);
                     return COMPRESSION_ERROR?;
                 }
                 // Dynamic table is LIFO, so index 0 = newest = dyn_count-1
                 usz actual_idx = dyn_count - 1 - (usz)dyn_index;
-                io::eprintfn("[HPACK] Indexed header %d from dynamic table (actual_idx=%d)", index, actual_idx);
                 headers[header_count++] = dynamic_table[actual_idx];
             }
         }
@@ -303,15 +290,12 @@ fn HeaderField[]? decode_header_block_with_settings(char[] data, usz max_dynamic
             }
 
             String value = decode_string(&data, &pos)!;
-            io::eprintfn("[HPACK] Literal header (incremental): name_len=%d value_len=%d", name.len, value.len);
             HeaderField hf = (HeaderField){ .name = name, .value = value };
             headers[header_count++] = hf;
 
             // Add to dynamic table (RFC 7541 Section 6.2.1)
             if (dyn_count < dynamic_table.len) {
                 dynamic_table[dyn_count++] = hf;
-                io::eprintfn("[HPACK] Added to dynamic table at index %d (will be HPACK index %d)",
-                             dyn_count - 1, STATIC_TABLE_SIZE + dyn_count);
             }
         }
         // Dynamic Table Size Update (RFC 7541 Section 6.3)
@@ -350,12 +334,10 @@ fn HeaderField[]? decode_header_block_with_settings(char[] data, usz max_dynamic
             }
 
             String value = decode_string(&data, &pos)!;
-            io::eprintfn("[HPACK] Literal header (no index): name_len=%d value_len=%d", name.len, value.len);
             headers[header_count++] = (HeaderField){ .name = name, .value = value };
         }
     }
 
-    io::eprintfn("[HPACK] Parsing complete: %d headers decoded", header_count);
     // Return a slice of the headers array
     return headers[0:header_count];
 }
@@ -373,12 +355,6 @@ fn String? decode_huffman(char[] data) {
         return "";
     }
 
-    // Debug: dump all bytes for h2spec investigation
-    io::eprintfn("[HUFFMAN] decode_huffman called with %d bytes:", data.len);
-    for (usz i = 0; i < data.len && i < 16; i++) {
-        io::eprintfn("[HUFFMAN]   byte[%d] = 0x%02x", i, (uint)(char)data[i]);
-    }
-
     // EOS detection is done in decode_huffman_symbol at symbol boundaries.
     // We cannot pre-scan for 30 consecutive 1-bits because valid Huffman codes
     // can produce 30+ consecutive 1s (e.g., multiple ';' characters encoded as 0xFF each).
@@ -393,10 +369,6 @@ fn String? decode_huffman(char[] data) {
     ulong bits = 0;     // Accumulated bits (64-bit to prevent overflow)
     uint num_bits = 0;  // Number of accumulated bits
     usz byte_idx = 0;   // Current byte index
-
-    // Track bits consumed for padding validation
-    usz total_bits = data.len * 8;
-    usz bits_consumed = 0;
 
     // Phase 1: Accumulate initial bits for decoding
     while (byte_idx < data.len && num_bits < 30) {
@@ -423,9 +395,7 @@ fn String? decode_huffman(char[] data) {
             // it would be decoded as multiple ';' characters (8-bit 0xFF each).
             if (num_bits >= 30) {
                 ulong top30 = (bits >> (num_bits - 30)) & 0x3FFFFFFF;
-                io::eprintfn("[HUFFMAN] EOS check: num_bits=%d, top30=0x%08x", num_bits, (uint)top30);
                 if (top30 == 0x3FFFFFFF) {
-                    io::eprintfn("[HUFFMAN] EOS DETECTED! Returning error.");
                     return EOS_IN_STRING?;  // EOS found at symbol boundary
                 }
             }
@@ -444,24 +414,14 @@ fn String? decode_huffman(char[] data) {
                 }
             }
 
-            uint bits_before = num_bits;
             int symbol = decode_huffman_symbol(&bits, &num_bits);
-            io::eprintfn("[HUFFMAN] Decoded symbol=%d ('%c'), bits: %d -> %d", symbol,
-                         (symbol >= 32 && symbol < 127) ? (char)symbol : '?', bits_before, num_bits);
             if (symbol < 0) {
                 if (symbol == -2) {
-                    io::eprintfn("[HUFFMAN] EOS returned from decode_huffman_symbol!");
                     return EOS_IN_STRING?;  // EOS symbol found
                 }
                 // Can't decode - need more bits or unsupported code
-                if (byte_idx >= data.len && data.len > 100) {
-                    io::eprintfn("[HPACK] Large string (%d bytes) decode stuck at output_len=%d, num_bits=%d, bits=0x%llx",
-                                 data.len, output_len, num_bits, bits);
-                }
                 break;  // Need more bits
             }
-
-            bits_consumed += (usz)(bits_before - num_bits);
 
             if (output_len >= output.len) {
                 return INVALID_HUFFMAN?;  // Output too large
@@ -479,22 +439,15 @@ fn String? decode_huffman(char[] data) {
         byte_idx++;
     }
 
-    // Calculate actual padding length
-    usz padding_bits = total_bits - bits_consumed;
-
     // RFC 7541 Section 5.2: "A padding strictly longer than 7 bits MUST be
     // treated as a decoding error."
-    if (padding_bits > 7) {
-        if (data.len > 100) {
-            io::eprintfn("[HPACK] Padding too long: %d bits (total=%d, consumed=%d, output_len=%d)",
-                         padding_bits, total_bits, bits_consumed, output_len);
-        }
+    if (num_bits > 7) {
         return INVALID_HUFFMAN?;  // Too much padding
     }
 
     // Validate padding bits are all 1s
-    if (padding_bits > 0) {
-        ulong padding_mask = (1ul << padding_bits) - 1;
+    if (num_bits > 0) {
+        ulong padding_mask = (1ul << num_bits) - 1;
         ulong actual_padding = bits & padding_mask;
         if (actual_padding != padding_mask) {
             return INVALID_HUFFMAN?;  // Padding not all 1s
